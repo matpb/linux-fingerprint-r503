@@ -70,6 +70,31 @@ async fn resolve_caller(
     pwd_lookup(uid).ok_or_else(|| FprintError::Internal(format!("uid {} not in passwd", uid)))
 }
 
+/// Update the polled `finger-present` / `finger-needed` properties from a
+/// firmware PROGRESS line. Best-effort hint for GUI clients that poll those
+/// properties — we don't emit PropertiesChanged, so transient state is only
+/// observable to actively-polling consumers.
+///
+/// Firmware vocabulary (`firmware/r503fp/r503fp.ino`):
+///   - "place_finger" / "place_again": sensor is waiting for a touch.
+///   - "remove_finger": a capture just succeeded, sensor is waiting for the
+///     finger to be lifted before the next stage (enroll only).
+async fn update_finger_state_from_progress(
+    state: &std::sync::Arc<tokio::sync::Mutex<DeviceState>>,
+    msg: &str,
+) {
+    let low = msg.to_lowercase();
+    let mut s = state.lock().await;
+    if low.contains("place_finger") || low.contains("place_again") {
+        s.finger_needed = true;
+        s.finger_present = false;
+    } else if low.contains("remove_finger") || low.contains("remove finger") {
+        // Capture just finished; finger is still on the sensor until lifted.
+        s.finger_needed = false;
+        s.finger_present = true;
+    }
+}
+
 /// Try deleting every slot from sensor flash; if any fail, surface the error
 /// so callers know the templates linger (registry rows are already gone — the
 /// next allocate_slot will eventually reuse the slot and the firmware's
@@ -434,12 +459,24 @@ impl Device {
         {
             let mut state = self.state.lock().await;
             state.finger_needed = true;
+            state.finger_present = false;
         }
         let owned_emitter = emitter.to_owned();
 
         let sensor = self.sensor.clone();
         let state = self.state.clone();
         let threshold = self.confidence_threshold;
+
+        // Progress channel: firmware PROGRESS lines drive finger-present /
+        // finger-needed so the polled properties reflect reality (the previous
+        // version set finger-present once at startup and never touched it).
+        let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let state_for_progress = self.state.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = prog_rx.recv().await {
+                update_finger_state_from_progress(&state_for_progress, &msg).await;
+            }
+        });
 
         // Verify keeps capturing until match / no-match / external stop / hard
         // error. Firmware-side "ERR timeout" / "ERR poor_quality" / capture
@@ -457,7 +494,7 @@ impl Device {
                     tracing::info!("verify externally stopped");
                     break None;
                 }
-                let result = sensor.verify(None).await;
+                let result = sensor.verify(Some(prog_tx.clone())).await;
                 match result {
                     Ok(MatchResult { slot, confidence }) => {
                         let accepted = expected_slots.contains(&slot)
@@ -604,17 +641,22 @@ impl Device {
         {
             let mut state = self.state.lock().await;
             state.finger_needed = true;
+            state.finger_present = false;
         }
         let owned_emitter = emitter.to_owned();
 
-        // Channel for progress lines from the sensor worker.
+        // Channel for progress lines from the sensor worker. Drives both the
+        // enroll-stage-passed signal AND the finger-present/finger-needed
+        // properties (firmware emits place_finger / remove_finger / place_again
+        // — see `update_finger_state_from_progress` for the mapping).
         let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let progress_emitter = owned_emitter.clone();
+        let state_for_progress = self.state.clone();
         let progress_handle = tokio::spawn(async move {
             while let Some(msg) = prog_rx.recv().await {
                 tracing::debug!(progress = %msg, "enroll progress");
+                update_finger_state_from_progress(&state_for_progress, &msg).await;
                 let low = msg.to_lowercase();
-                // Firmware emits: "place_finger", "remove_finger", "place_again".
                 // fprintd consumers expect enroll-stage-passed between captures.
                 if low.contains("remove_finger") || low.contains("remove finger") {
                     Device::enroll_status(&progress_emitter, "enroll-stage-passed", false)
