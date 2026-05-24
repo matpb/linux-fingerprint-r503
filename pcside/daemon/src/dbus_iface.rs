@@ -532,16 +532,30 @@ impl Device {
             state.action_in_progress = Some("enroll");
         }
 
-        // If already enrolled, free the old slot first.
-        if let Some(existing) = self.storage.get_slot(&user, &finger_name).await {
-            tracing::info!(user = %user, finger = %finger_name, slot = existing, "re-enrolling, freeing old slot");
-            if let Err(e) = self.sensor.delete(existing).await {
-                tracing::warn!("delete old slot failed: {}", e);
+        // From here on, ANY error path must clear action_in_progress before
+        // returning — otherwise the device wedges into "enroll" forever and
+        // every subsequent Verify/Enroll fails with AlreadyInUse until the
+        // claimer disconnects. Allocation runs inside a scoped async block so
+        // we have a single `?` boundary to wrap with a cleanup match.
+        let alloc_result: Result<u8, FprintError> = async {
+            if let Some(existing) = self.storage.get_slot(&user, &finger_name).await {
+                tracing::info!(user = %user, finger = %finger_name, slot = existing, "re-enrolling, freeing old slot");
+                if let Err(e) = self.sensor.delete(existing).await {
+                    tracing::warn!("delete old slot failed: {}", e);
+                }
+                self.storage.remove_finger(&user, &finger_name).await?;
             }
-            self.storage.remove_finger(&user, &finger_name).await?;
+            Ok(self.storage.allocate_slot().await?)
         }
+        .await;
 
-        let slot = self.storage.allocate_slot().await?;
+        let slot = match alloc_result {
+            Ok(s) => s,
+            Err(e) => {
+                self.state.lock().await.action_in_progress = None;
+                return Err(e);
+            }
+        };
         tracing::info!(user = %user, finger = %finger_name, slot, "EnrollStart");
         {
             let mut state = self.state.lock().await;
