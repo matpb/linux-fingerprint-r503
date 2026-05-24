@@ -13,7 +13,7 @@ use zbus::zvariant::OwnedObjectPath;
 use crate::error::FprintError;
 use crate::sensor::{MatchResult, SensorError};
 use crate::sensor_actor::SensorActor;
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageError};
 
 pub const MANAGER_PATH: &str = "/net/reactivated/Fprint/Manager";
 pub const DEVICE_PATH: &str = "/net/reactivated/Fprint/Device/0";
@@ -535,25 +535,39 @@ impl Device {
         // From here on, ANY error path must clear action_in_progress before
         // returning — otherwise the device wedges into "enroll" forever and
         // every subsequent Verify/Enroll fails with AlreadyInUse until the
-        // claimer disconnects. Allocation runs inside a scoped async block so
-        // we have a single `?` boundary to wrap with a cleanup match.
-        let alloc_result: Result<u8, FprintError> = async {
-            if let Some(existing) = self.storage.get_slot(&user, &finger_name).await {
-                tracing::info!(user = %user, finger = %finger_name, slot = existing, "re-enrolling, freeing old slot");
-                if let Err(e) = self.sensor.delete(existing).await {
-                    tracing::warn!("delete old slot failed: {}", e);
-                }
-                self.storage.remove_finger(&user, &finger_name).await?;
+        // claimer disconnects.
+        if let Some(existing) = self.storage.get_slot(&user, &finger_name).await {
+            tracing::info!(user = %user, finger = %finger_name, slot = existing, "re-enrolling, freeing old slot");
+            if let Err(e) = self.sensor.delete(existing).await {
+                tracing::warn!("delete old slot failed: {}", e);
             }
-            Ok(self.storage.allocate_slot().await?)
+            if let Err(e) = self.storage.remove_finger(&user, &finger_name).await {
+                self.state.lock().await.action_in_progress = None;
+                return Err(e.into());
+            }
         }
-        .await;
 
-        let slot = match alloc_result {
+        let slot = match self.storage.allocate_slot().await {
             Ok(s) => s,
+            Err(StorageError::NoFreeSlot(_)) => {
+                // Spec compliance: this is the upstream FP_DEVICE_ERROR_DATA_FULL
+                // case. Don't fail EnrollStart synchronously — return Ok and emit
+                // the terminal status async, so spec-aware clients (kcm_users,
+                // gnome-control-center) get the "enroll-data-full" signal they're
+                // listening for instead of an opaque Internal error.
+                tracing::warn!(user = %user, finger = %finger_name, "sensor flash full — emitting enroll-data-full");
+                self.state.lock().await.action_in_progress = None;
+                let owned_emitter = emitter.to_owned();
+                tokio::spawn(async move {
+                    Device::enroll_status(&owned_emitter, "enroll-data-full", true)
+                        .await
+                        .ok();
+                });
+                return Ok(());
+            }
             Err(e) => {
                 self.state.lock().await.action_in_progress = None;
-                return Err(e);
+                return Err(e.into());
             }
         };
         tracing::info!(user = %user, finger = %finger_name, slot, "EnrollStart");
