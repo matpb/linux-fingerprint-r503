@@ -42,6 +42,32 @@ enum SensorRequest {
     LedOff(oneshot::Sender<Result<(), SensorError>>),
 }
 
+/// Outcome of running one request against the sensor.
+/// - `Done`: result was sent to the caller (success or non-IO error).
+/// - `NeedsReopen(req)`: the operation hit a fatal I/O error before sending
+///   a result; the worker should drop the sensor, reopen, and retry the
+///   returned request so the caller still sees a single response.
+enum HandleOutcome {
+    Done,
+    NeedsReopen(SensorRequest),
+}
+
+/// An I/O error that means the underlying serial port is no longer usable —
+/// distinguishes "the sensor said no to that operation" from "the device is
+/// physically gone." On a USB unplug we see `BrokenPipe` (read after device
+/// removal) or `NotFound` (open after path went away).
+fn is_fatal_io(err: &SensorError) -> bool {
+    use std::io::ErrorKind::*;
+    if let SensorError::Io(e) = err {
+        matches!(
+            e.kind(),
+            BrokenPipe | NotFound | NotConnected | UnexpectedEof | PermissionDenied
+        )
+    } else {
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct SensorActor {
     tx: mpsc::UnboundedSender<SensorRequest>,
@@ -51,30 +77,80 @@ pub struct SensorActor {
 impl SensorActor {
     /// Open the sensor on the given port (or auto-detect), spawn the worker,
     /// probe `info()` once for capacity caching. Returns once the sensor is
-    /// fully open and responsive.
+    /// fully open and responsive. The worker thread survives subsequent USB
+    /// unplug/replug cycles by lazily re-opening on the next request after an
+    /// I/O failure.
     pub async fn spawn(port: Option<String>) -> anyhow::Result<Self> {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<SensorRequest>();
         let (open_tx, open_rx) = oneshot::channel::<Result<(), SensorError>>();
 
-        // Worker thread — owns the R503 forever.
         std::thread::Builder::new()
             .name("r503-worker".into())
             .spawn(move || {
-                let sensor_result = R503::open(port.as_deref(), Duration::from_secs(8));
-                let mut sensor = match sensor_result {
+                // Initial open — must succeed or the daemon won't start.
+                let mut sensor: Option<R503> = match R503::open(port.as_deref(), Duration::from_secs(8)) {
                     Ok(s) => {
                         let _ = open_tx.send(Ok(()));
-                        s
+                        Some(s)
                     }
                     Err(e) => {
                         let _ = open_tx.send(Err(e));
                         return;
                     }
                 };
-                tracing::info!(port = sensor.port_path(), "R503 sensor open");
+                tracing::info!(
+                    port = sensor.as_ref().map(|s| s.port_path()).unwrap_or("?"),
+                    "R503 sensor open"
+                );
 
-                while let Some(req) = req_rx.blocking_recv() {
-                    Self::handle_request(&mut sensor, req);
+                while let Some(initial_req) = req_rx.blocking_recv() {
+                    // Inner loop: serve this request, with up to one transparent
+                    // reopen+retry on fatal I/O. The caller sees a single
+                    // response regardless of how many reopen attempts happened.
+                    let mut req = initial_req;
+                    let mut already_retried = false;
+                    loop {
+                        // Ensure the sensor is open.
+                        if sensor.is_none() {
+                            match R503::open(port.as_deref(), Duration::from_secs(8)) {
+                                Ok(s) => {
+                                    tracing::info!(
+                                        port = s.port_path(),
+                                        "R503 sensor RECONNECTED"
+                                    );
+                                    sensor = Some(s);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("sensor unavailable: {}", e);
+                                    Self::respond_with_error(req, e);
+                                    break;
+                                }
+                            }
+                        }
+                        let s = sensor.as_mut().unwrap();
+                        match Self::handle_request(s, req) {
+                            HandleOutcome::Done => break,
+                            HandleOutcome::NeedsReopen(returned_req) => {
+                                tracing::warn!(
+                                    "sensor I/O error — will reopen and retry the request"
+                                );
+                                sensor = None;
+                                if already_retried {
+                                    Self::respond_with_error(
+                                        returned_req,
+                                        SensorError::Io(std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "sensor failed twice in a row",
+                                        )),
+                                    );
+                                    break;
+                                }
+                                already_retried = true;
+                                req = returned_req;
+                                // loop back to reopen + retry
+                            }
+                        }
+                    }
                 }
                 tracing::info!("R503 sensor worker exiting");
             })
@@ -97,52 +173,151 @@ impl SensorActor {
         Ok(actor)
     }
 
-    fn handle_request(sensor: &mut R503, req: SensorRequest) {
+    fn handle_request(sensor: &mut R503, req: SensorRequest) -> HandleOutcome {
         // Reset the progress callback to a no-op default; per-op overrides
         // happen just below for the multi-step ops.
         sensor.set_progress(|msg: &str| tracing::trace!(progress = msg));
+
+        // Install a progress callback derived from a clone of the per-request
+        // sender, so that on retry (after re-open) we can install a fresh one.
+        fn install_progress(sensor: &mut R503, progress: &Option<ProgressTx>) {
+            if let Some(tx) = progress {
+                let tx = tx.clone();
+                sensor.set_progress(move |msg: &str| {
+                    let _ = tx.send(msg.to_string());
+                });
+            }
+        }
+
         match req {
             SensorRequest::Info(done) => {
-                let _ = done.send(sensor.info());
+                let result = sensor.info();
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Info(done));
+                }
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::Enroll { slot, progress, done } => {
-                if let Some(tx) = progress {
-                    sensor.set_progress(move |msg: &str| {
-                        let _ = tx.send(msg.to_string());
+                install_progress(sensor, &progress);
+                let result = sensor.enroll(slot);
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Enroll {
+                        slot,
+                        progress,
+                        done,
                     });
                 }
-                let _ = done.send(sensor.enroll(slot));
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::Verify { progress, done } => {
-                if let Some(tx) = progress {
-                    sensor.set_progress(move |msg: &str| {
-                        let _ = tx.send(msg.to_string());
+                install_progress(sensor, &progress);
+                let result = sensor.verify();
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Verify {
+                        progress,
+                        done,
                     });
                 }
-                let _ = done.send(sensor.verify());
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::Identify { progress, done } => {
-                if let Some(tx) = progress {
-                    sensor.set_progress(move |msg: &str| {
-                        let _ = tx.send(msg.to_string());
+                install_progress(sensor, &progress);
+                let result = sensor.identify();
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Identify {
+                        progress,
+                        done,
                     });
                 }
-                let _ = done.send(sensor.identify());
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::Delete { slot, done } => {
-                let _ = done.send(sensor.delete(slot));
+                let result = sensor.delete(slot);
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Delete { slot, done });
+                }
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::Clear(done) => {
-                let _ = done.send(sensor.clear());
+                let result = sensor.clear();
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Clear(done));
+                }
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::Wake(done) => {
-                let _ = done.send(sensor.wake());
+                let result = sensor.wake();
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Wake(done));
+                }
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::Ping(done) => {
-                let _ = done.send(sensor.ping());
+                let result = sensor.ping();
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::Ping(done));
+                }
+                let _ = done.send(result);
+                HandleOutcome::Done
             }
             SensorRequest::LedOff(done) => {
-                let _ = done.send(sensor.led_off());
+                let result = sensor.led_off();
+                if matches!(&result, Err(e) if is_fatal_io(e)) {
+                    return HandleOutcome::NeedsReopen(SensorRequest::LedOff(done));
+                }
+                let _ = done.send(result);
+                HandleOutcome::Done
+            }
+        }
+    }
+
+    /// Fan a single error out to whichever oneshot is in the variant. Used when
+    /// the sensor is unavailable and we need to reject an incoming request
+    /// without serving it.
+    fn respond_with_error(req: SensorRequest, err: SensorError) {
+        // SensorError isn't Clone, so we need to construct a fresh error per
+        // variant. We forward the original via `to_string()` wrapped in a
+        // synthetic Io error so the client sees a consistent shape.
+        fn dup(e: &SensorError) -> SensorError {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                e.to_string(),
+            ))
+        }
+        match req {
+            SensorRequest::Info(done) => {
+                let _ = done.send(Err(err));
+            }
+            SensorRequest::Enroll { done, .. } => {
+                let _ = done.send(Err(dup(&err)));
+            }
+            SensorRequest::Verify { done, .. } => {
+                let _ = done.send(Err(dup(&err)));
+            }
+            SensorRequest::Identify { done, .. } => {
+                let _ = done.send(Err(dup(&err)));
+            }
+            SensorRequest::Delete { done, .. } => {
+                let _ = done.send(Err(dup(&err)));
+            }
+            SensorRequest::Clear(done) => {
+                let _ = done.send(Err(dup(&err)));
+            }
+            SensorRequest::Wake(done) => {
+                let _ = done.send(Err(dup(&err)));
+            }
+            SensorRequest::Ping(done) => {
+                let _ = done.send(Err(dup(&err)));
+            }
+            SensorRequest::LedOff(done) => {
+                let _ = done.send(Err(dup(&err)));
             }
         }
     }

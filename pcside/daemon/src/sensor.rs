@@ -109,16 +109,33 @@ impl R503 {
         self.on_progress = Box::new(f);
     }
 
-    /// Drain firmware boot output until 300ms of silence, then ping/pong.
-    /// Opening the port DTR-resets the Uno, so we have to ride out the boot
-    /// banner before sending real commands — otherwise `ping` gets queued in
-    /// the input buffer while setup() is still running.
+    /// Quiescence-then-ping handshake.
+    ///
+    /// When opening the port triggers a DTR reset on the Uno (cold connect),
+    /// the firmware's setup() prints "R503FP READY" + a full info() line over
+    /// ~2.5s. We wait for 300ms of silence after the LAST byte to know boot
+    /// has finished.
+    ///
+    /// But opens that DON'T trigger a DTR reset (e.g. opening the same kernel
+    /// cdc-acm node after a daemon restart, or a re-open with no power cycle)
+    /// produce NO boot output at all — the Uno is already in its main loop.
+    /// In that case waiting indefinitely for the first byte would chew the
+    /// whole timeout budget; we cap the drain phase at `first_byte_grace` and
+    /// proceed straight to ping if nothing arrives.
     fn sync(&mut self, timeout: Duration) -> Result<(), SensorError> {
         let deadline = Instant::now() + timeout;
+        let first_byte_grace = Duration::from_millis(800);
+        let silence_after_byte = Duration::from_millis(300);
+        let drain_start = Instant::now();
         let mut last_byte_at: Option<Instant> = None;
         let mut buf = [0u8; 256];
         loop {
             if Instant::now() >= deadline {
+                break;
+            }
+            // No bytes ever arrived AND grace period elapsed → Uno is already
+            // in main loop, skip ahead to ping.
+            if last_byte_at.is_none() && drain_start.elapsed() > first_byte_grace {
                 break;
             }
             self.port.set_timeout(Duration::from_millis(100)).ok();
@@ -129,7 +146,7 @@ impl R503 {
                 }
                 Err(ref e) if e.kind() == ErrorKind::TimedOut => {
                     if let Some(t) = last_byte_at {
-                        if t.elapsed() > Duration::from_millis(300) {
+                        if t.elapsed() > silence_after_byte {
                             break;
                         }
                     }
@@ -140,21 +157,28 @@ impl R503 {
         self.rx_buf.clear();
         let _ = self.port.clear(serialport::ClearBuffer::Input);
 
-        self.port.write_all(b"ping\n")?;
-        self.port.flush()?;
-        let pong_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
-        loop {
-            match self.read_line(pong_deadline)? {
-                Some(l) if l == "OK pong" => return Ok(()),
-                Some(_) => continue,
-                None => {
-                    return Err(SensorError::Timeout(format!(
-                        "could not synchronize with firmware (no OK pong within {:?})",
-                        timeout
-                    )));
+        // Phase 2 — retry pings until we hear "OK pong" or run out of budget.
+        // A ping sent while setup() is still running (cold boot) gets either
+        // queued past the boot banner or lost; the next one always lands once
+        // the main loop starts. Per-ping wait is 1s, the outer deadline caps
+        // total attempts.
+        while Instant::now() < deadline {
+            self.port.write_all(b"ping\n")?;
+            self.port.flush()?;
+            let per_attempt = Instant::now() + Duration::from_secs(1);
+            let attempt_deadline = per_attempt.min(deadline);
+            loop {
+                match self.read_line(attempt_deadline)? {
+                    Some(l) if l == "OK pong" => return Ok(()),
+                    Some(_) => continue,
+                    None => break, // attempt timed out — outer loop will retry
                 }
             }
         }
+        Err(SensorError::Timeout(format!(
+            "could not synchronize with firmware (no OK pong within {:?})",
+            timeout
+        )))
     }
 
     /// Read one newline-terminated line, or None on deadline.
