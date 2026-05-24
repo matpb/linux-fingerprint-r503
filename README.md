@@ -5,6 +5,10 @@ under $15. Drop-in replacement for upstream `fprintd` — PAM, KDE Settings,
 GNOME Settings, `fprintd-verify`, `sudo` with finger, screen-unlock with
 finger all work.
 
+![R503 sensor mounted in a hand-cut wooden enclosure, blue ring glowing](docs/images/hero.jpg)
+
+*wish I had a 3d printer…*
+
 ```
    ┌──────────┐   UART    ┌─────────────┐   USB-CDC   ┌──────────────────┐
    │  Grow    │  57600 8N1│  Arduino    │  /dev/r503  │  r503d daemon    │
