@@ -1,0 +1,39 @@
+[Unit]
+Description=R503 fingerprint daemon (fprintd-replacement)
+Documentation=https://github.com/matpb/r503-fpr
+After=dbus.service systemd-udevd.service
+Wants=dbus.service
+# Conflicts with upstream fprintd — only one can own net.reactivated.Fprint.
+Conflicts=fprintd.service
+
+[Service]
+Type=dbus
+BusName=net.reactivated.Fprint
+ExecStart=/usr/local/bin/r503d
+Restart=on-failure
+RestartSec=2s
+User=root
+Environment=RUST_LOG=info,r503d=info
+
+# Hardening — daemon needs serial port + state dir + system bus.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/r503d
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+DevicePolicy=closed
+DeviceAllow=char-ttyACM rw
+DeviceAllow=char-ttyUSB rw
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

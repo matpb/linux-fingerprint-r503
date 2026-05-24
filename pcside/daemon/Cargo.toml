@@ -1,0 +1,30 @@
+[package]
+name = "r503d"
+version = "0.1.0"
+edition = "2024"
+description = "fprintd-replacement daemon for the R503 fingerprint reader over USB-serial"
+license = "MIT"
+
+[[bin]]
+name = "r503d"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+serialport = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+libc = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1

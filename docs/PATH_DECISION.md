@@ -4,9 +4,20 @@
 **Status:** Recommendation made; awaiting Mat's sign-off before implementing
 **Spike inputs:** libfprint upstream git tip (cloned to `/tmp/libfprint`), installed `libfprint-1.94.7` + `fprintd-1.94.5` + `fprintd-pam-1.94.5` on Fedora 44
 
-## TL;DR — Recommendation: **Path C (Python fprintd-replacement daemon)**
+## TL;DR — Decision: **Path C (fprintd-replacement daemon, written in Rust)**
 
-C is ~3× less work than A or B, ships zero custom C, doesn't require maintaining a forked system package, and reuses the working `r503ctl.py`. It costs us libfprint compatibility (other libfprint frontends won't see our device) — but the only frontends that matter on Mat's box (`fprintd-enroll`, `fprintd-verify`, `pam_fprintd`) go through fprintd's D-Bus surface, which we can fully replace.
+C is ~3× less work than A or B, doesn't require maintaining a forked system package, and replaces fprintd at the D-Bus surface that `pam_fprintd` actually talks to. It costs libfprint compatibility (other libfprint frontends won't see our device) — but the only frontends that matter on Mat's box (`fprintd-enroll`, `fprintd-verify`, `pam_fprintd`) go through fprintd's D-Bus surface, which we own.
+
+### Language pivot (2026-05-24): Rust over Python
+
+Original draft of this doc proposed Python (`dbus-python` + `pyserial`) for the daemon, primarily to reuse the bench-prototype `r503ctl.py` directly. On reconsideration that was the wrong default for a daemon that:
+
+- Runs **as root**,
+- Owns a **well-known system bus name** consumed by `pam_fprintd`,
+- Sits in the auth path for `sudo`, SDDM, and the screen lock — i.e. the security perimeter,
+- Will live on Mat's daily-driver for years.
+
+Rust (`zbus` + `serialport`) gives us a memory-safe static binary, zero runtime deps, and ~5ms cold start, in exchange for ~2× the implementation effort vs Python. The 200-LOC ASCII-protocol port from `r503ctl.py` is mechanical; the prototype becomes the canonical spec rather than throwaway. Long-term maintenance burden is meaningfully lower.
 
 ## The three paths
 
@@ -79,20 +90,22 @@ Replace fprintd with a Python daemon that:
 - Other libfprint consumers (GNOME Settings' fingerprint UI, KDE's `kcm_fingerprint`, etc.) won't see our device. On Mat's box this is a non-issue — KDE Plasma 6's fingerprint settings call into fprintd's D-Bus surface, which we own. Same for any GNOME tool. The *only* thing we'd miss is `fprintd-list` style tooling that introspects libfprint directly without going through fprintd, and that's vanishingly rare.
 - Sharing the driver upstream is harder. But the R503-on-Arduino setup is so niche that upstream adoption was never realistic anyway — most users buying a Grow R503 would integrate it differently (Raspberry Pi GPIO, ESPHome, etc.).
 
-## Implementation outline if Path C is approved
+## Implementation outline
 
-1. **Init the repo as git** (`git init && git add . && git commit -m "initial bench prototype"`) — currently uncommitted.
-2. **Spike pam_fprintd's D-Bus conversation** — enable fprintd debug logging, run `fprintd-verify` against the libfprint virtual device (`FP_VIRTUAL_DEVICE=/tmp/sock`), capture the full method-call sequence. ~30 min.
-3. **Scaffold `pcside/daemon/r503d.py`** — `dbus-next` (async, Pythonic, supports system bus, mature). Define `net.reactivated.Fprint.Manager` + `Device` skeletons. ~1 h.
-4. **Wire `r503ctl.py` library API as the backend** — open `/dev/ttyACM0` once at daemon start, expose `enroll(slot)`, `verify()`, `delete(slot)`, `info()` to the D-Bus handlers. ~1 h.
-5. **Persist per-user slot mapping** — `/var/lib/r503d/users.json` (`{"mat": [{"finger": "right-thumb", "slot": 0}, ...]}`). ~30 min.
-6. **systemd unit + D-Bus service file** — `r503d.service` (replaces `fprintd.service`), `/usr/share/dbus-1/system-services/net.reactivated.Fprint.service` repointed. Stop + mask system fprintd. ~30 min.
-7. **Validate `fprintd-enroll mat` and `fprintd-verify`** end-to-end. ~1 h debug.
-8. **PAM wiring** via `authselect` (Fedora's PAM stack manager) — `authselect select sssd with-fingerprint`, or hand-edit `/etc/pam.d/sudo` etc. ~30 min.
-9. **KDE screen lock test** — `loginctl lock-session`, place finger, confirm unlock. ~15 min.
-10. **SDDM login test** — log out, place finger at SDDM, confirm login. ~15 min.
+1. **Init the repo as git** — DONE 2026-05-24, initial commit `main`.
+2. **Scaffold Rust crate at `pcside/daemon/`** — `cargo init --bin r503d`. Dependencies: `tokio` (full features), `zbus` v5 (tokio executor), `serialport`, `serde`/`serde_json`, `tracing`/`tracing-subscriber`, `clap` (derive), `thiserror`, `anyhow`. ~30 min.
+3. **Port `r503ctl.py` library API to `src/sensor.rs`** — `R503` struct holding the open `SerialPort`, methods `info()`, `enroll(slot)`, `verify()`, `delete(slot)`, `clear()`, `wake()`. Same `_sync()` quiescence-then-ping handshake; same line-based parser; same `PROGRESS` callback shape (Rust: `mpsc::Sender<String>`). All sensor calls are blocking and wrapped in `tokio::task::spawn_blocking`. ~2 h.
+4. **`src/storage.rs`** — `Storage` struct over `serde_json` persisted to `/var/lib/r503d/users.json`. Per-user `HashMap<String, u8>` (finger → slot). Atomic write via temp-file rename. `Arc<RwLock<…>>` for shared access. ~30 min.
+5. **`src/dbus.rs`** — `zbus::interface` macros for `net.reactivated.Fprint.Manager` and `…Device`. Manager is trivial (`GetDevices`, `GetDefaultDevice`). Device wraps the sensor + storage; methods return immediately, signals (`VerifyStatus`, `EnrollStatus`, `VerifyFingerSelected`) fire from background tasks. Errors map via `#[zbus(error)]` enum to `net.reactivated.Fprint.Error.*`. ~3 h.
+6. **`src/main.rs`** — CLI (`--session`, `--port`, `--storage`, `--confidence`), tracing setup, bus connection, signal handlers (SIGTERM/SIGINT), graceful shutdown. ~30 min.
+7. **Smoke-test on session bus** — `cargo run -- --session`, drive Device via `gdbus call --session --dest net.reactivated.Fprint …`, confirm signal sequencing matches what `pam_fprintd` expects. ~1–2 h.
+8. **systemd unit + D-Bus service file** — `r503d.service` (replaces `fprintd.service`), `/usr/share/dbus-1/system-services/net.reactivated.Fprint.service` repointed to `/usr/local/bin/r503d`. Stop + mask system fprintd. ~30 min.
+9. **Validate `fprintd-enroll mat` and `fprintd-verify`** end-to-end. ~1 h debug.
+10. **PAM wiring** via `authselect` (Fedora's PAM stack manager) — `authselect select sssd with-fingerprint`. ~30 min.
+11. **KDE screen lock test** — `loginctl lock-session`, place finger, confirm unlock. ~15 min.
+12. **SDDM login test** — log out, place finger at SDDM, confirm login. ~15 min.
 
-Total: **5–8 hours of focused work**, mostly Python + systemd + PAM, very little novel debugging.
+Total: **~10–14 hours of focused work**, mostly Rust + zbus learning curve + systemd + PAM.
 
 ## Open questions for Mat
 

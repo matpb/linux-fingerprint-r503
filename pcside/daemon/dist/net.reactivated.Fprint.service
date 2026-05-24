@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=net.reactivated.Fprint
+Exec=/usr/local/bin/r503d
+User=root
+SystemdService=r503d.service
