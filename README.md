@@ -1,4 +1,4 @@
-# r503-fpr — fingerprint login for Linux using a Grow R503 + Arduino
+# linux-fingerprint-r503 — fingerprint login for Linux using a Grow R503 + Arduino
 
 A from-parts USB fingerprint reader for Linux desktops. Total parts cost
 under $15. Drop-in replacement for upstream `fprintd` — PAM, KDE Settings,

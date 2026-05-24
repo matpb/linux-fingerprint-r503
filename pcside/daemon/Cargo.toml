@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "fprintd-replacement daemon for the R503 fingerprint reader over USB-serial"
 license = "MIT"
-repository = "https://github.com/matpb/r503-fpr"
+repository = "https://github.com/matpb/linux-fingerprint-r503"
 readme = "../../README.md"
 
 [[bin]]

@@ -1,6 +1,6 @@
 [Unit]
 Description=R503 fingerprint daemon (fprintd-replacement)
-Documentation=https://github.com/matpb/r503-fpr
+Documentation=https://github.com/matpb/linux-fingerprint-r503
 After=dbus.service systemd-udevd.service
 Wants=dbus.service
 # Conflicts with upstream fprintd — only one can own net.reactivated.Fprint.

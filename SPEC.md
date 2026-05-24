@@ -284,7 +284,7 @@ If Sunday afternoon goes badly (Path A turns out to be impossible and Path C is 
 ## 10. Repository Layout
 
 ```
-r503-fpr/
+linux-fingerprint-r503/
 ├── README.md
 ├── SPEC.md                          # This document
 ├── LICENSE                          # LGPL-2.1-or-later
