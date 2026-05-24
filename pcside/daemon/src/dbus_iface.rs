@@ -47,10 +47,27 @@ fn validate_finger(name: &str, allow_any: bool) -> Result<(), FprintError> {
 }
 
 fn effective_user() -> String {
-    // Fall back to the current uid's name. With polkit later we'll resolve the
-    // caller's uid instead.
     let uid = unsafe { libc::getuid() };
     pwd_lookup(uid).unwrap_or_else(|| uid.to_string())
+}
+
+/// Resolve the calling client's username by asking the bus daemon for the
+/// sender's uid and looking up /etc/passwd. fprintd's empty-username convention
+/// means "use the caller's identity" — without this resolution, an empty
+/// string falls back to the daemon's own uid (root), which is never useful.
+async fn resolve_caller(
+    conn: &zbus::Connection,
+    sender: Option<&str>,
+) -> Result<String, FprintError> {
+    let sender = sender.ok_or_else(|| FprintError::Internal("missing sender".into()))?;
+    let bus_name = zbus::names::BusName::try_from(sender)
+        .map_err(|e| FprintError::Internal(format!("invalid sender {}: {}", sender, e)))?;
+    let dbus = zbus::fdo::DBusProxy::new(conn).await?;
+    let uid = dbus
+        .get_connection_unix_user(bus_name)
+        .await
+        .map_err(|e| FprintError::Internal(format!("GetConnectionUnixUser: {}", e)))?;
+    pwd_lookup(uid).ok_or_else(|| FprintError::Internal(format!("uid {} not in passwd", uid)))
 }
 
 /// Cheap getpwuid_r without pulling in the `nix` crate. Returns the username
@@ -201,21 +218,16 @@ impl Device {
 
     async fn list_enrolled_fingers(
         &self,
-        #[zbus(header)] _header: zbus::message::Header<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
         username: String,
     ) -> Result<Vec<String>, FprintError> {
-        // Empty username = "the caller themselves". Fall back to the currently
-        // claimed user, otherwise to the daemon process owner (which is mat on
-        // the session bus / root on the system bus). pam_fprintd always passes
-        // an explicit username, so this only matters for fprintd-list and
-        // direct gdbus testing.
+        // Empty username = "the caller themselves". Resolve via
+        // org.freedesktop.DBus.GetConnectionUnixUser so we actually
+        // identify the caller, not the daemon (which runs as root).
         let user = if username.is_empty() {
-            self.state
-                .lock()
-                .await
-                .claimed_by
-                .clone()
-                .unwrap_or_else(effective_user)
+            let sender = header.sender().map(|s| s.to_string());
+            resolve_caller(conn, sender.as_deref()).await?
         } else {
             username
         };
@@ -229,8 +241,19 @@ impl Device {
         Ok(fingers)
     }
 
-    async fn delete_enrolled_fingers(&self, username: String) -> Result<(), FprintError> {
-        let slots = self.storage.remove_user(&username).await?;
+    async fn delete_enrolled_fingers(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        username: String,
+    ) -> Result<(), FprintError> {
+        let user = if username.is_empty() {
+            let sender = header.sender().map(|s| s.to_string());
+            resolve_caller(conn, sender.as_deref()).await?
+        } else {
+            username
+        };
+        let slots = self.storage.remove_user(&user).await?;
         for s in slots {
             if let Err(e) = self.sensor.delete(s).await {
                 tracing::warn!("sensor delete slot {} failed: {}", s, e);
@@ -282,8 +305,15 @@ impl Device {
     async fn claim(
         &self,
         #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
         username: String,
     ) -> Result<(), FprintError> {
+        let sender = header.sender().map(|s| s.to_string());
+        let user = if username.is_empty() {
+            resolve_caller(conn, sender.as_deref()).await?
+        } else {
+            username
+        };
         let mut state = self.state.lock().await;
         if let Some(existing) = &state.claimed_by {
             return Err(FprintError::AlreadyInUse(format!(
@@ -291,12 +321,6 @@ impl Device {
                 existing
             )));
         }
-        let sender = header.sender().map(|s| s.to_string());
-        let user = if username.is_empty() {
-            sender.clone().unwrap_or_else(effective_user)
-        } else {
-            username
-        };
         tracing::info!(user = %user, sender = ?sender, "Device claimed");
         state.claimed_by = Some(user);
         state.claim_sender = sender;
