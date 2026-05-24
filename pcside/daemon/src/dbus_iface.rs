@@ -70,6 +70,32 @@ async fn resolve_caller(
     pwd_lookup(uid).ok_or_else(|| FprintError::Internal(format!("uid {} not in passwd", uid)))
 }
 
+/// Try deleting every slot from sensor flash; if any fail, surface the error
+/// so callers know the templates linger (registry rows are already gone — the
+/// next allocate_slot will eventually reuse the slot and the firmware's
+/// storeModel will overwrite). Caller is responsible for the registry remove
+/// having already happened.
+async fn delete_slots_or_report(
+    sensor: &crate::sensor_actor::SensorActor,
+    slots: Vec<u8>,
+) -> Result<(), FprintError> {
+    let mut errors: Vec<String> = Vec::new();
+    for s in slots {
+        if let Err(e) = sensor.delete(s).await {
+            tracing::warn!("sensor delete slot {} failed: {}", s, e);
+            errors.push(format!("slot {}: {}", s, e));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(FprintError::PrintsNotDeleted(format!(
+            "removed from registry but sensor delete failed: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
 /// Cheap getpwuid_r without pulling in the `nix` crate. Returns the username
 /// for the given uid, or None on failure.
 fn pwd_lookup(uid: u32) -> Option<String> {
@@ -254,12 +280,7 @@ impl Device {
             username
         };
         let slots = self.storage.remove_user(&user).await?;
-        for s in slots {
-            if let Err(e) = self.sensor.delete(s).await {
-                tracing::warn!("sensor delete slot {} failed: {}", s, e);
-            }
-        }
-        Ok(())
+        delete_slots_or_report(&self.sensor, slots).await
     }
 
     #[zbus(name = "DeleteEnrolledFingers2")]
@@ -270,12 +291,7 @@ impl Device {
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
         let slots = self.storage.remove_user(&user).await?;
-        for s in slots {
-            if let Err(e) = self.sensor.delete(s).await {
-                tracing::warn!("sensor delete slot {} failed: {}", s, e);
-            }
-        }
-        Ok(())
+        delete_slots_or_report(&self.sensor, slots).await
     }
 
     async fn delete_enrolled_finger(
@@ -298,6 +314,10 @@ impl Device {
             })?;
         if let Err(e) = self.sensor.delete(slot).await {
             tracing::warn!("sensor delete slot {} failed: {}", slot, e);
+            return Err(FprintError::PrintsNotDeleted(format!(
+                "removed from registry but sensor delete failed for slot {}: {}",
+                slot, e
+            )));
         }
         Ok(())
     }
@@ -381,7 +401,17 @@ impl Device {
         }
 
         let (selected, expected_slots): (String, HashSet<u8>) = if finger_name == "any" {
-            let first = user_slots.keys().next().cloned().unwrap_or_default();
+            // VerifyFingerSelected wants a single finger name. user_slots is a
+            // HashMap, so .keys().next() returns a different finger each run —
+            // a UI prompt that says "place your left-thumb" one time and "place
+            // your right-index-finger" the next is awful. Pick the first finger
+            // in canonical anatomical order (FINGER_NAMES) that the user has
+            // actually enrolled.
+            let first = FINGER_NAMES
+                .iter()
+                .find(|name| user_slots.contains_key(**name))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
             (first, user_slots.values().copied().collect())
         } else {
             let slot = match user_slots.get(&finger_name) {
