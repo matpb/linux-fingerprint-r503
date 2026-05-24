@@ -55,13 +55,17 @@ enum HandleOutcome {
 /// An I/O error that means the underlying serial port is no longer usable —
 /// distinguishes "the sensor said no to that operation" from "the device is
 /// physically gone." On a USB unplug we see `BrokenPipe` (read after device
-/// removal) or `NotFound` (open after path went away).
+/// removal) or `NotFound` (open after path went away). serialport-rs sometimes
+/// surfaces the kernel-side disconnect as `Other` (the TIOCMGET / termios ioctl
+/// just returns ENXIO/ENODEV with no clean ErrorKind mapping), so that bucket
+/// has to be treated as fatal too — otherwise an unplug looks like a transient
+/// I/O blip and the worker never reopens.
 fn is_fatal_io(err: &SensorError) -> bool {
     use std::io::ErrorKind::*;
     if let SensorError::Io(e) = err {
         matches!(
             e.kind(),
-            BrokenPipe | NotFound | NotConnected | UnexpectedEof | PermissionDenied
+            BrokenPipe | NotFound | NotConnected | UnexpectedEof | PermissionDenied | Other
         )
     } else {
         false
@@ -110,21 +114,44 @@ impl SensorActor {
                     let mut req = initial_req;
                     let mut already_retried = false;
                     loop {
-                        // Ensure the sensor is open.
+                        // Ensure the sensor is open. The reopen path races udev:
+                        // after an unplug+replug the kernel creates /dev/ttyACM*
+                        // before our 70-r503.rules has finished applying, so
+                        // /dev/r503 may not exist for ~100-300ms. Retry a few
+                        // times with exponential backoff before giving up.
                         if sensor.is_none() {
-                            match R503::open(port.as_deref(), Duration::from_secs(8)) {
-                                Ok(s) => {
-                                    tracing::info!(
-                                        port = s.port_path(),
-                                        "R503 sensor RECONNECTED"
-                                    );
-                                    sensor = Some(s);
+                            const REOPEN_ATTEMPTS: u32 = 4;
+                            let mut last_err: Option<SensorError> = None;
+                            for attempt in 0..REOPEN_ATTEMPTS {
+                                if attempt > 0 {
+                                    let delay_ms = 150u64 << (attempt - 1).min(3);
+                                    std::thread::sleep(Duration::from_millis(delay_ms));
                                 }
-                                Err(e) => {
-                                    tracing::warn!("sensor unavailable: {}", e);
-                                    Self::respond_with_error(req, e);
-                                    break;
+                                match R503::open(port.as_deref(), Duration::from_secs(8)) {
+                                    Ok(s) => {
+                                        tracing::info!(
+                                            port = s.port_path(),
+                                            attempt,
+                                            "R503 sensor RECONNECTED"
+                                        );
+                                        sensor = Some(s);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(attempt, "reopen failed: {}", e);
+                                        last_err = Some(e);
+                                    }
                                 }
+                            }
+                            if sensor.is_none() {
+                                let err = last_err.unwrap_or_else(|| {
+                                    SensorError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::NotConnected,
+                                        "sensor reopen failed after retries",
+                                    ))
+                                });
+                                Self::respond_with_error(req, err);
+                                break;
                             }
                         }
                         let s = sensor.as_mut().unwrap();
