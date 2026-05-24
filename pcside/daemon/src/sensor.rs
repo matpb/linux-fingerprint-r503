@@ -168,7 +168,9 @@ impl R503 {
         // "OK pong" and returning a SensorInfo full of zeros.
         while Instant::now() < deadline {
             self.rx_buf.clear();
-            let _ = self.port.clear(serialport::ClearBuffer::Input);
+            self.port
+                .clear(serialport::ClearBuffer::Input)
+                .map_err(|e| SensorError::Io(e.into()))?;
             self.port.write_all(b"ping\n")?;
             self.port.flush()?;
             let per_attempt = Instant::now() + Duration::from_secs(1);
@@ -177,9 +179,13 @@ impl R503 {
                 match self.read_line(attempt_deadline)? {
                     Some(l) if l == "OK pong" => {
                         // Belt-and-suspenders: discard anything queued behind
-                        // the pong before handing control back.
+                        // the pong before handing control back. A failure here
+                        // is non-fatal — we just got a valid pong, the port
+                        // works; log and proceed.
                         self.rx_buf.clear();
-                        let _ = self.port.clear(serialport::ClearBuffer::Input);
+                        if let Err(e) = self.port.clear(serialport::ClearBuffer::Input) {
+                            tracing::debug!("post-pong drain clear() failed: {}", e);
+                        }
                         return Ok(());
                     }
                     Some(_) => continue,
@@ -236,10 +242,14 @@ impl R503 {
     /// that hit Rust-side timeout may have left a late OK/ERR line in the
     /// kernel queue or in `rx_buf`, and we don't want it to satisfy the next
     /// command. (The firmware is single-threaded and won't reply out of order,
-    /// so dropping stale bytes is always safe.)
+    /// so dropping stale bytes is always safe.) A clear() failure means the
+    /// port is genuinely broken — surface it now rather than letting the
+    /// subsequent write+flush block on a dead fd.
     fn execute(&mut self, cmd: &str, timeout_ms: u64) -> Result<String, SensorError> {
         self.rx_buf.clear();
-        let _ = self.port.clear(serialport::ClearBuffer::Input);
+        self.port
+            .clear(serialport::ClearBuffer::Input)
+            .map_err(|e| SensorError::Io(e.into()))?;
         self.send(cmd)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
@@ -293,13 +303,25 @@ impl R503 {
     pub fn info(&mut self) -> Result<SensorInfo, SensorError> {
         let body = Self::expect_ok(self.execute("info", TIMEOUT_INFO_MS)?)?;
         let kv = Self::parse_kv(&body);
-        // `capacity` is required — a missing/garbled value would silently
-        // collapse to 0, which then makes allocate_slot() return NoFreeSlot for
-        // every enroll. Treat it as a protocol error so the daemon refuses to
-        // start instead of failing every later enroll with a confusing reason.
+        // `capacity` drives slot allocation. The R503 datasheet specifies 200
+        // and our firmware reports the same; a garbled `capacity=` (firmware
+        // bug, partial line read, parser regression) used to silently collapse
+        // to 0 and make every enroll fail NoFreeSlot. Falling back to the
+        // datasheet default keeps the daemon usable for list/verify/delete
+        // even on a malformed info response, and a warn log surfaces the
+        // problem at the diagnostics layer.
+        const R503_DATASHEET_CAPACITY: u16 = 200;
+        let capacity = Self::parse_field(&kv, "capacity").unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                fallback = R503_DATASHEET_CAPACITY,
+                "malformed info.capacity — using R503 datasheet default"
+            );
+            R503_DATASHEET_CAPACITY
+        });
         Ok(SensorInfo {
             fw: kv.get("fw").cloned().unwrap_or_default(),
-            capacity: Self::parse_field(&kv, "capacity")?,
+            capacity,
             enrolled: Self::parse_field(&kv, "enrolled").unwrap_or(0),
             sysid: kv.get("sysid").cloned().unwrap_or_default(),
             security: Self::parse_field(&kv, "security").unwrap_or(0),

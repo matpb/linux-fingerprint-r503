@@ -128,15 +128,26 @@ impl SensorActor {
                         // before our 70-r503.rules has finished applying, so
                         // /dev/r503 may not exist for ~100-300ms. Retry a few
                         // times with exponential backoff before giving up.
+                        //
+                        // sync_timeout is shorter than the initial-open path:
+                        // initial open faces a DTR-on-open Arduino reset that
+                        // takes ~2.5s of boot output before the firmware is
+                        // ready, so 8s is appropriate there. Reopen targets an
+                        // already-running firmware that responds to ping in
+                        // <50ms; 1.5s leaves margin for a slow ping retry
+                        // without burning the worker on an unresponsive device
+                        // past the libdbus 25s method-call timeout (4 attempts
+                        // × 1.5s + ~1s backoff ≈ 7s worst case).
                         if sensor.is_none() {
                             const REOPEN_ATTEMPTS: u32 = 4;
+                            const REOPEN_SYNC_TIMEOUT: Duration = Duration::from_millis(1500);
                             let mut last_err: Option<SensorError> = None;
                             for attempt in 0..REOPEN_ATTEMPTS {
                                 if attempt > 0 {
                                     let delay_ms = 150u64 << (attempt - 1).min(3);
                                     std::thread::sleep(Duration::from_millis(delay_ms));
                                 }
-                                match R503::open(port.as_deref(), Duration::from_secs(8)) {
+                                match R503::open(port.as_deref(), REOPEN_SYNC_TIMEOUT) {
                                     Ok(s) => {
                                         tracing::info!(
                                             port = s.port_path(),
