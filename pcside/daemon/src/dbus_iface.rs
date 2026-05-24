@@ -415,11 +415,17 @@ impl Device {
         // error. Firmware-side "ERR timeout" / "ERR poor_quality" / capture
         // failures become verify-retry-scan signals (done=false) and the worker
         // loops back to call sensor.verify() again.
+        //
+        // `final_status = None` means the operation was stopped externally
+        // (VerifyStop / claimer disconnect) — no terminal signal should be
+        // emitted because the caller already knows they stopped it. We used to
+        // emit "verify-disconnected" here, which collided with the spec's
+        // meaning of "the sensor itself dropped off the bus."
         tokio::spawn(async move {
-            let final_status: &'static str = loop {
-                // Bail if VerifyStop was called externally.
+            let final_status: Option<&'static str> = loop {
                 if state.lock().await.action_in_progress != Some("verify") {
-                    break "verify-disconnected";
+                    tracing::info!("verify externally stopped");
+                    break None;
                 }
                 let result = sensor.verify(None).await;
                 match result {
@@ -428,14 +434,14 @@ impl Device {
                             && confidence >= threshold;
                         let status = if accepted { "verify-match" } else { "verify-no-match" };
                         tracing::info!(slot, confidence, accepted, "verify done");
-                        break status;
+                        break Some(status);
                     }
                     Err(SensorError::Command { code, detail }) => {
                         let code_low = code.to_lowercase();
                         // Firmware vocab: no_match (final), timeout / poor_quality /
                         // capture_failed=N / image2tz_failed=N (retry).
                         if code_low == "no_match" {
-                            break "verify-no-match";
+                            break Some("verify-no-match");
                         }
                         if code_low == "timeout"
                             || code_low == "poor_quality"
@@ -451,7 +457,7 @@ impl Device {
                             continue;
                         }
                         tracing::warn!("verify err: {} {:?}", code, detail);
-                        break "verify-unknown-error";
+                        break Some("verify-unknown-error");
                     }
                     Err(SensorError::Timeout(_)) => {
                         // Rust-side timeout (shouldn't normally fire — the firmware's
@@ -462,8 +468,12 @@ impl Device {
                         continue;
                     }
                     Err(e) => {
+                        if crate::sensor_actor::is_fatal_io(&e) {
+                            tracing::warn!("verify disconnected: {}", e);
+                            break Some("verify-disconnected");
+                        }
                         tracing::warn!("verify unexpected error: {}", e);
-                        break "verify-unknown-error";
+                        break Some("verify-unknown-error");
                     }
                 }
             };
@@ -471,10 +481,17 @@ impl Device {
                 let mut s = state.lock().await;
                 s.finger_needed = false;
                 s.finger_present = false;
-                s.action_in_progress = None;
+                // Only clear if this verify still owns the action slot — a
+                // successor enroll/verify may have started after VerifyStop
+                // released our claim, and we mustn't wipe their state.
+                if s.action_in_progress == Some("verify") {
+                    s.action_in_progress = None;
+                }
             }
-            if let Err(e) = Device::verify_status(&owned_emitter, final_status, true).await {
-                tracing::warn!("emit final VerifyStatus failed: {}", e);
+            if let Some(status) = final_status {
+                if let Err(e) = Device::verify_status(&owned_emitter, status, true).await {
+                    tracing::warn!("emit final VerifyStatus failed: {}", e);
+                }
             }
         });
 
@@ -561,7 +578,12 @@ impl Device {
                 let mut s = state.lock().await;
                 s.finger_needed = false;
                 s.finger_present = false;
-                s.action_in_progress = None;
+                // Only clear if this enroll still owns the slot — EnrollStop
+                // (or a claimer crash) may have released the claim and a
+                // successor verify/enroll could have already taken over.
+                if s.action_in_progress == Some("enroll") {
+                    s.action_in_progress = None;
+                }
             }
             match result {
                 Ok(_actual_slot) => {

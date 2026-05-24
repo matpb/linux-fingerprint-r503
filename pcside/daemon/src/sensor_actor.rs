@@ -60,7 +60,10 @@ enum HandleOutcome {
 /// just returns ENXIO/ENODEV with no clean ErrorKind mapping), so that bucket
 /// has to be treated as fatal too — otherwise an unplug looks like a transient
 /// I/O blip and the worker never reopens.
-fn is_fatal_io(err: &SensorError) -> bool {
+///
+/// Exposed pub(crate) so the D-Bus interface can map post-reopen-failure
+/// errors to `verify-disconnected` / `enroll-disconnected` status signals.
+pub(crate) fn is_fatal_io(err: &SensorError) -> bool {
     use std::io::ErrorKind::*;
     if let SensorError::Io(e) = err {
         matches!(
