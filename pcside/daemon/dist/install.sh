@@ -23,36 +23,48 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-echo ">>> [1/8] installing r503d binary -> /usr/local/bin/r503d"
+echo ">>> [1/9] installing r503d binary -> /usr/local/bin/r503d"
 install -m 0755 -o root -g root "$BINARY" /usr/local/bin/r503d
 
-echo ">>> [2/8] creating /var/lib/r503d state dir"
+echo ">>> [2/9] creating /var/lib/r503d state dir"
 install -d -m 0700 -o root -g root /var/lib/r503d
 
 # Preserve sensor-flash slot mapping from session-bus testing, if present.
 if [[ -f "$SESSION_STORAGE" && ! -f /var/lib/r503d/users.json ]]; then
-    echo ">>> [3/8] seeding /var/lib/r503d/users.json from $SESSION_STORAGE"
+    echo ">>> [3/9] seeding /var/lib/r503d/users.json from $SESSION_STORAGE"
     install -m 0600 -o root -g root "$SESSION_STORAGE" /var/lib/r503d/users.json
 else
-    echo ">>> [3/8] /var/lib/r503d/users.json already exists or no session seed — skipping"
+    echo ">>> [3/9] /var/lib/r503d/users.json already exists or no session seed — skipping"
 fi
 
-echo ">>> [4/8] installing systemd unit -> /etc/systemd/system/r503d.service"
+echo ">>> [4/9] installing udev rule -> /etc/udev/rules.d/70-r503.rules"
+install -m 0644 -o root -g root "$DIST_DIR/70-r503.rules" /etc/udev/rules.d/70-r503.rules
+udevadm control --reload
+udevadm trigger --subsystem-match=tty
+sleep 1
+if [[ -L /dev/r503 ]]; then
+    echo "    /dev/r503 -> $(readlink -f /dev/r503)"
+else
+    echo "    (no /dev/r503 yet — no Arduino plugged in, or VID/PID not covered by the rule;"
+    echo "     daemon will fall back to scanning /dev/ttyACM* and /dev/ttyUSB*)"
+fi
+
+echo ">>> [5/9] installing systemd unit -> /etc/systemd/system/r503d.service"
 install -m 0644 -o root -g root "$DIST_DIR/r503d.service" /etc/systemd/system/r503d.service
 
-echo ">>> [5/8] overriding D-Bus autolaunch -> /usr/local/share/dbus-1/system-services/"
+echo ">>> [6/9] overriding D-Bus autolaunch -> /usr/local/share/dbus-1/system-services/"
 install -d -m 0755 /usr/local/share/dbus-1/system-services
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.Fprint.service" \
     /usr/local/share/dbus-1/system-services/net.reactivated.Fprint.service
 
-echo ">>> [6/8] systemctl daemon-reload"
+echo ">>> [7/9] systemctl daemon-reload"
 systemctl daemon-reload
 
-echo ">>> [7/8] stopping + masking fprintd.service"
+echo ">>> [8/9] stopping + masking fprintd.service"
 systemctl stop fprintd.service 2>/dev/null || true
 systemctl mask fprintd.service
 
-echo ">>> [8/8] enabling + starting r503d.service"
+echo ">>> [9/9] enabling + starting r503d.service"
 systemctl enable r503d.service
 systemctl restart r503d.service
 

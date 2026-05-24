@@ -1,0 +1,33 @@
+# /etc/udev/rules.d/70-r503.rules
+#
+# Map any common Arduino-compatible USB-serial device to a stable
+# `/dev/r503` symlink so r503d binds to the same path regardless of which
+# /dev/ttyACM*/ttyUSB* slot the kernel assigned this boot.
+#
+# If you have MULTIPLE matching devices plugged in, only one wins the
+# symlink (the most-recently-attached one). For deterministic binding in
+# a multi-device setup, add a more specific rule above these that
+# constrains by ATTRS{serial}=="<your_serial>".
+#
+# Find your device's IDs:
+#   lsusb                                       # → 2341:0043 etc.
+#   udevadm info -q all -n /dev/ttyACM0 | head  # → ATTRS{serial}=="..."
+#
+# After editing this file:
+#   sudo udevadm control --reload && sudo udevadm trigger
+
+# Arduino LLC — genuine Uno, Mega, Leonardo, Micro, Nano Every, Nano IoT, etc.
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2341", SYMLINK+="r503", TAG+="r503-device"
+
+# Arduino SRL — the legacy arduino.org fork (still in the wild on some boards)
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2a03", SYMLINK+="r503", TAG+="r503-device"
+
+# WCH CH340/CH341 USB-serial — used on most Nano clones (Elegoo, SunFounder, Keyestudio, etc.)
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="r503", TAG+="r503-device"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5523", SYMLINK+="r503", TAG+="r503-device"
+
+# FTDI FT232RL — older Nanos with FTDI bridge; also some Diecimila clones
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="r503", TAG+="r503-device"
+
+# Silicon Labs CP2102/CP2104 — found on some clone boards and ESP8266 dev boards
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="r503", TAG+="r503-device"

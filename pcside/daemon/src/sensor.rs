@@ -337,9 +337,22 @@ impl R503 {
     }
 }
 
-/// Auto-detect /dev/ttyACM* (preferred — genuine Uno R3) over /dev/ttyUSB*
-/// (CH340 clones). Returns the lexicographically-first match.
+/// Discover the R503-attached Arduino's serial device.
+///
+/// Preference order:
+///   1. `/dev/r503` — the stable symlink created by `70-r503.rules` (matches
+///      common Arduino-compatible VID/PIDs). This is the supported path for
+///      anyone running the installer.
+///   2. `/dev/ttyACM*` — genuine Arduinos (ATmega16U2 / Native USB).
+///   3. `/dev/ttyUSB*` — CH340 / FTDI clones.
+///
+/// The fall-throughs exist so that a user without the udev rule installed
+/// (e.g. running the daemon manually for development) still works.
 pub fn find_port() -> Result<String, SensorError> {
+    let symlink = PathBuf::from("/dev/r503");
+    if symlink.exists() {
+        return Ok(symlink.to_string_lossy().into_owned());
+    }
     for pattern in &["ttyACM", "ttyUSB"] {
         let mut matches = Vec::new();
         if let Ok(entries) = std::fs::read_dir("/dev") {
