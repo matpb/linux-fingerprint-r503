@@ -15,7 +15,6 @@ use crate::sensor::{MatchResult, R503, SensorError, SensorInfo};
 /// each PROGRESS line; the caller (D-Bus interface) reads them and translates
 /// to fprintd signals.
 pub type ProgressTx = mpsc::UnboundedSender<String>;
-pub type ProgressRx = mpsc::UnboundedReceiver<String>;
 
 enum SensorRequest {
     Info(oneshot::Sender<Result<SensorInfo, SensorError>>),

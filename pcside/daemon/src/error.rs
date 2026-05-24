@@ -16,9 +16,6 @@ pub enum FprintError {
     /// The device is already in use by another claimer or operation.
     AlreadyInUse(String),
 
-    /// PolicyKit denied (not used yet, here for future-compat).
-    PermissionDenied(String),
-
     /// No prints enrolled for the requested user / finger.
     NoEnrolledPrints(String),
 
@@ -28,11 +25,8 @@ pub enum FprintError {
     /// Finger name string not in the fprintd-defined set.
     InvalidFingername(String),
 
-    /// Print deletion failed (storage layer rejected the change).
+    /// Print deletion failed (sensor flash or storage layer rejected).
     PrintsNotDeleted(String),
-
-    /// Manager.GetDefaultDevice when no devices exist.
-    NoSuchDevice(String),
 }
 
 impl From<zbus::Error> for FprintError {

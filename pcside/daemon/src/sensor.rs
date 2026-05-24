@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 const DEFAULT_BAUD: u32 = 115_200;
 
 const TIMEOUT_INFO_MS: u64 = 2_000;
-const TIMEOUT_COUNT_MS: u64 = 2_000;
 const TIMEOUT_ENROLL_MS: u64 = 45_000;
 const TIMEOUT_VERIFY_MS: u64 = 15_000;
 const TIMEOUT_DELETE_MS: u64 = 2_000;
@@ -47,9 +46,6 @@ pub struct SensorInfo {
     pub fw: String,
     pub capacity: u16,
     pub enrolled: u16,
-    pub sysid: String,
-    pub security: u8,
-    pub device_addr: String,
 }
 
 #[derive(Debug, Clone)]
@@ -323,15 +319,7 @@ impl R503 {
             fw: kv.get("fw").cloned().unwrap_or_default(),
             capacity,
             enrolled: Self::parse_field(&kv, "enrolled").unwrap_or(0),
-            sysid: kv.get("sysid").cloned().unwrap_or_default(),
-            security: Self::parse_field(&kv, "security").unwrap_or(0),
-            device_addr: kv.get("device_addr").cloned().unwrap_or_default(),
         })
-    }
-
-    pub fn count(&mut self) -> Result<u16, SensorError> {
-        let body = Self::expect_ok(self.execute("count", TIMEOUT_COUNT_MS)?)?;
-        Self::parse_field(&Self::parse_kv(&body), "count")
     }
 
     pub fn enroll(&mut self, slot: u8) -> Result<u8, SensorError> {

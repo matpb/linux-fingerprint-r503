@@ -18,9 +18,6 @@ use crate::storage::{Storage, StorageError};
 pub const MANAGER_PATH: &str = "/net/reactivated/Fprint/Manager";
 pub const DEVICE_PATH: &str = "/net/reactivated/Fprint/Device/0";
 
-pub const MANAGER_INTERFACE: &str = "net.reactivated.Fprint.Manager";
-pub const DEVICE_INTERFACE: &str = "net.reactivated.Fprint.Device";
-
 /// All valid fingerprint names per the fprintd spec.
 const FINGER_NAMES: &[&str] = &[
     "left-thumb",
@@ -44,11 +41,6 @@ fn validate_finger(name: &str, allow_any: bool) -> Result<(), FprintError> {
     } else {
         Err(FprintError::InvalidFingername(name.to_string()))
     }
-}
-
-fn effective_user() -> String {
-    let uid = unsafe { libc::getuid() };
-    pwd_lookup(uid).unwrap_or_else(|| uid.to_string())
 }
 
 /// Resolve the calling client's username by asking the bus daemon for the

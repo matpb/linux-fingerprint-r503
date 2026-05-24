@@ -60,10 +60,6 @@ impl Storage {
         Ok(storage)
     }
 
-    pub async fn set_capacity(&self, capacity: u16) {
-        self.inner.write().await.capacity = capacity;
-    }
-
     pub async fn list_fingers(&self, username: &str) -> Vec<String> {
         let guard = self.inner.read().await;
         let mut v: Vec<String> = guard
@@ -159,20 +155,6 @@ impl Storage {
         };
         self.save().await?;
         Ok(slot)
-    }
-
-    pub async fn remove_user(&self, username: &str) -> Result<Vec<u8>, StorageError> {
-        let slots = {
-            let mut guard = self.inner.write().await;
-            guard
-                .data
-                .users
-                .remove(username)
-                .map(|m| m.into_values().collect())
-                .unwrap_or_default()
-        };
-        self.save().await?;
-        Ok(slots)
     }
 
     async fn save(&self) -> Result<(), StorageError> {
