@@ -95,27 +95,42 @@ async fn update_finger_state_from_progress(
     }
 }
 
-/// Try deleting every slot from sensor flash; if any fail, surface the error
-/// so callers know the templates linger (registry rows are already gone — the
-/// next allocate_slot will eventually reuse the slot and the firmware's
-/// storeModel will overwrite). Caller is responsible for the registry remove
-/// having already happened.
-async fn delete_slots_or_report(
+/// Wipe every (finger, slot) pair for a user. Deletes from sensor flash FIRST,
+/// then removes from the registry — and only the (finger, slot) pairs whose
+/// sensor delete actually succeeded. Partial-success returns a PrintsNotDeleted
+/// listing every slot that still lives in flash, so a caller can retry and the
+/// surviving registry rows still authenticate against their templates.
+async fn delete_user_fingers(
     sensor: &crate::sensor_actor::SensorActor,
-    slots: Vec<u8>,
+    storage: &crate::storage::Storage,
+    user: &str,
 ) -> Result<(), FprintError> {
+    let entries = storage.get_user_slots(user).await;
+    if entries.is_empty() {
+        return Ok(());
+    }
     let mut errors: Vec<String> = Vec::new();
-    for s in slots {
-        if let Err(e) = sensor.delete(s).await {
-            tracing::warn!("sensor delete slot {} failed: {}", s, e);
-            errors.push(format!("slot {}: {}", s, e));
+    let mut succeeded: Vec<String> = Vec::new();
+    for (finger, slot) in entries {
+        match sensor.delete(slot).await {
+            Ok(_) => succeeded.push(finger),
+            Err(e) => {
+                tracing::warn!("sensor delete slot {} ({}) failed: {}", slot, finger, e);
+                errors.push(format!("{} (slot {}): {}", finger, slot, e));
+            }
+        }
+    }
+    for finger in &succeeded {
+        if let Err(e) = storage.remove_finger(user, finger).await {
+            tracing::warn!("registry remove {} failed after sensor delete: {}", finger, e);
+            errors.push(format!("{} (registry write): {}", finger, e));
         }
     }
     if errors.is_empty() {
         Ok(())
     } else {
         Err(FprintError::PrintsNotDeleted(format!(
-            "removed from registry but sensor delete failed: {}",
+            "partial delete: {}",
             errors.join("; ")
         )))
     }
@@ -176,10 +191,61 @@ struct DeviceState {
     claimed_by: Option<String>,
     /// D-Bus unique name of the claimer so Release/VerifyStart can verify it.
     claim_sender: Option<String>,
-    /// "enroll" | "verify" | None.
-    action_in_progress: Option<&'static str>,
+    /// Current in-flight action, if any. `epoch` distinguishes successive
+    /// enroll/verify operations of the SAME kind so an abandoned task can't
+    /// stomp the successor's state at cleanup time.
+    action: Option<ActionToken>,
+    /// Monotonic counter to mint fresh epoch ids.
+    next_epoch: u64,
     finger_present: bool,
     finger_needed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActionToken {
+    kind: ActionKind,
+    epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionKind {
+    Enroll,
+    Verify,
+}
+
+impl ActionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ActionKind::Enroll => "enroll",
+            ActionKind::Verify => "verify",
+        }
+    }
+}
+
+impl DeviceState {
+    /// Mint a fresh ActionToken for a new operation and install it. Caller is
+    /// responsible for having already verified `self.action.is_none()`.
+    fn start_action(&mut self, kind: ActionKind) -> ActionToken {
+        let epoch = self.next_epoch;
+        self.next_epoch = self.next_epoch.wrapping_add(1);
+        let token = ActionToken { kind, epoch };
+        self.action = Some(token);
+        token
+    }
+
+    /// Clear the action slot AND finger-* hints, but ONLY if `expected` still
+    /// owns the slot. Returns whether the clear happened — task cleanup uses
+    /// this to decide whether to emit a terminal status signal.
+    fn end_action_if_owner(&mut self, expected: ActionToken) -> bool {
+        if self.action == Some(expected) {
+            self.action = None;
+            self.finger_needed = false;
+            self.finger_present = false;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub struct Device {
@@ -229,7 +295,9 @@ impl Device {
             );
             state.claimed_by = None;
             state.claim_sender = None;
-            state.action_in_progress = None;
+            state.action = None;
+            state.finger_needed = false;
+            state.finger_present = false;
         }
     }
 }
@@ -304,8 +372,7 @@ impl Device {
         } else {
             username
         };
-        let slots = self.storage.remove_user(&user).await?;
-        delete_slots_or_report(&self.sensor, slots).await
+        delete_user_fingers(&self.sensor, &self.storage, &user).await
     }
 
     #[zbus(name = "DeleteEnrolledFingers2")]
@@ -315,8 +382,7 @@ impl Device {
     ) -> Result<(), FprintError> {
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
-        let slots = self.storage.remove_user(&user).await?;
-        delete_slots_or_report(&self.sensor, slots).await
+        delete_user_fingers(&self.sensor, &self.storage, &user).await
     }
 
     async fn delete_enrolled_finger(
@@ -329,8 +395,8 @@ impl Device {
         let user = self.ensure_claim(sender.as_deref()).await?;
         let slot = self
             .storage
-            .remove_finger(&user, &finger_name)
-            .await?
+            .get_slot(&user, &finger_name)
+            .await
             .ok_or_else(|| {
                 FprintError::NoEnrolledPrints(format!(
                     "{} not enrolled for {}",
@@ -340,10 +406,12 @@ impl Device {
         if let Err(e) = self.sensor.delete(slot).await {
             tracing::warn!("sensor delete slot {} failed: {}", slot, e);
             return Err(FprintError::PrintsNotDeleted(format!(
-                "removed from registry but sensor delete failed for slot {}: {}",
+                "sensor delete failed for slot {}: {}",
                 slot, e
             )));
         }
+        // Sensor template gone; registry remove is the bookkeeping tail.
+        self.storage.remove_finger(&user, &finger_name).await?;
         Ok(())
     }
 
@@ -391,7 +459,9 @@ impl Device {
         tracing::info!(user = ?state.claimed_by, "Device released");
         state.claimed_by = None;
         state.claim_sender = None;
-        state.action_in_progress = None;
+        state.action = None;
+        state.finger_needed = false;
+        state.finger_present = false;
         Ok(())
     }
 
@@ -405,44 +475,36 @@ impl Device {
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
 
-        {
+        let my_token = {
             let mut state = self.state.lock().await;
-            if let Some(action) = state.action_in_progress {
+            if let Some(t) = state.action {
                 return Err(FprintError::AlreadyInUse(format!(
                     "{} already in progress",
-                    action
+                    t.kind.as_str()
                 )));
             }
-            state.action_in_progress = Some("verify");
-        }
+            state.start_action(ActionKind::Verify)
+        };
 
+        // Build expected_slots + the name we'll advertise via VerifyFingerSelected.
+        // For "any", we emit the literal "any" so the UI doesn't lie about which
+        // finger the user must place. expected_slots is the union of every
+        // enrolled slot, so a match on any of them succeeds.
         let user_slots = self.storage.get_user_slots(&user).await;
         if user_slots.is_empty() {
-            self.state.lock().await.action_in_progress = None;
+            self.state.lock().await.end_action_if_owner(my_token);
             return Err(FprintError::NoEnrolledPrints(format!(
                 "no enrolled prints for {}",
                 user
             )));
         }
-
         let (selected, expected_slots): (String, HashSet<u8>) = if finger_name == "any" {
-            // VerifyFingerSelected wants a single finger name. user_slots is a
-            // HashMap, so .keys().next() returns a different finger each run —
-            // a UI prompt that says "place your left-thumb" one time and "place
-            // your right-index-finger" the next is awful. Pick the first finger
-            // in canonical anatomical order (FINGER_NAMES) that the user has
-            // actually enrolled.
-            let first = FINGER_NAMES
-                .iter()
-                .find(|name| user_slots.contains_key(**name))
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-            (first, user_slots.values().copied().collect())
+            ("any".to_string(), user_slots.values().copied().collect())
         } else {
             let slot = match user_slots.get(&finger_name) {
                 Some(s) => *s,
                 None => {
-                    self.state.lock().await.action_in_progress = None;
+                    self.state.lock().await.end_action_if_owner(my_token);
                     return Err(FprintError::NoEnrolledPrints(format!(
                         "{} not enrolled for {}",
                         finger_name, user
@@ -467,48 +529,42 @@ impl Device {
         let state = self.state.clone();
         let threshold = self.confidence_threshold;
 
-        // Progress channel: firmware PROGRESS lines drive finger-present /
-        // finger-needed so the polled properties reflect reality (the previous
-        // version set finger-present once at startup and never touched it).
-        let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let state_for_progress = self.state.clone();
+        // Single task: drives the verify retry-loop AND processes PROGRESS
+        // lines inline via select!, so there's no second receiver task to
+        // leak and no abort-races-queued-message footgun.
         tokio::spawn(async move {
-            while let Some(msg) = prog_rx.recv().await {
-                update_finger_state_from_progress(&state_for_progress, &msg).await;
-            }
-        });
+            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-        // Verify keeps capturing until match / no-match / external stop / hard
-        // error. Firmware-side "ERR timeout" / "ERR poor_quality" / capture
-        // failures become verify-retry-scan signals (done=false) and the worker
-        // loops back to call sensor.verify() again.
-        //
-        // `final_status = None` means the operation was stopped externally
-        // (VerifyStop / claimer disconnect) — no terminal signal should be
-        // emitted because the caller already knows they stopped it. We used to
-        // emit "verify-disconnected" here, which collided with the spec's
-        // meaning of "the sensor itself dropped off the bus."
-        tokio::spawn(async move {
-            let final_status: Option<&'static str> = loop {
-                if state.lock().await.action_in_progress != Some("verify") {
+            let final_status: Option<&'static str> = 'outer: loop {
+                if state.lock().await.action != Some(my_token) {
                     tracing::info!("verify externally stopped");
-                    break None;
+                    break 'outer None;
                 }
-                let result = sensor.verify(Some(prog_tx.clone())).await;
+                let verify_fut = sensor.verify(Some(prog_tx.clone()));
+                tokio::pin!(verify_fut);
+                let result = loop {
+                    tokio::select! {
+                        biased;
+                        Some(msg) = prog_rx.recv() => {
+                            update_finger_state_from_progress(&state, &msg).await;
+                        }
+                        result = &mut verify_fut => break result,
+                    }
+                };
                 match result {
                     Ok(MatchResult { slot, confidence }) => {
                         let accepted = expected_slots.contains(&slot)
                             && confidence >= threshold;
                         let status = if accepted { "verify-match" } else { "verify-no-match" };
                         tracing::info!(slot, confidence, accepted, "verify done");
-                        break Some(status);
+                        break 'outer Some(status);
                     }
                     Err(SensorError::Command { code, detail }) => {
                         let code_low = code.to_lowercase();
                         // Firmware vocab: no_match (final), timeout / poor_quality /
                         // capture_failed=N / image2tz_failed=N (retry).
                         if code_low == "no_match" {
-                            break Some("verify-no-match");
+                            break 'outer Some("verify-no-match");
                         }
                         if code_low == "timeout"
                             || code_low == "poor_quality"
@@ -519,12 +575,11 @@ impl Device {
                             Device::verify_status(&owned_emitter, "verify-retry-scan", false)
                                 .await
                                 .ok();
-                            // Small backoff so we don't busy-loop on sensor_unreachable etc.
                             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             continue;
                         }
                         tracing::warn!("verify err: {} {:?}", code, detail);
-                        break Some("verify-unknown-error");
+                        break 'outer Some("verify-unknown-error");
                     }
                     Err(SensorError::Timeout(_)) => {
                         // Rust-side timeout (shouldn't normally fire — the firmware's
@@ -537,28 +592,44 @@ impl Device {
                     Err(e) => {
                         if crate::sensor_actor::is_fatal_io(&e) {
                             tracing::warn!("verify disconnected: {}", e);
-                            break Some("verify-disconnected");
+                            break 'outer Some("verify-disconnected");
                         }
                         tracing::warn!("verify unexpected error: {}", e);
-                        break Some("verify-unknown-error");
+                        break 'outer Some("verify-unknown-error");
                     }
                 }
             };
-            {
-                let mut s = state.lock().await;
-                s.finger_needed = false;
-                s.finger_present = false;
-                // Only clear if this verify still owns the action slot — a
-                // successor enroll/verify may have started after VerifyStop
-                // released our claim, and we mustn't wipe their state.
-                if s.action_in_progress == Some("verify") {
-                    s.action_in_progress = None;
+
+            // Drain any trailing PROGRESS lines so finger-* properties don't
+            // settle on a stale value. Bounded by a short window because the
+            // sensor actor's progress closure keeps our prog_tx clone alive
+            // until the next sensor command replaces it.
+            drop(prog_tx);
+            let drain_deadline = tokio::time::sleep(std::time::Duration::from_millis(50));
+            tokio::pin!(drain_deadline);
+            loop {
+                tokio::select! {
+                    _ = &mut drain_deadline => break,
+                    msg = prog_rx.recv() => match msg {
+                        Some(m) => update_finger_state_from_progress(&state, &m).await,
+                        None => break,
+                    }
                 }
             }
-            if let Some(status) = final_status {
-                if let Err(e) = Device::verify_status(&owned_emitter, status, true).await {
-                    tracing::warn!("emit final VerifyStatus failed: {}", e);
+
+            // Epoch-guarded cleanup + emit: if a successor (or VerifyStop)
+            // has replaced our action token, drop both the state reset and
+            // the final-status emit silently — the original caller is gone
+            // and the new owner mustn't see a stale signal.
+            let still_ours = state.lock().await.end_action_if_owner(my_token);
+            if still_ours {
+                if let Some(status) = final_status {
+                    if let Err(e) = Device::verify_status(&owned_emitter, status, true).await {
+                        tracing::warn!("emit final VerifyStatus failed: {}", e);
+                    }
                 }
+            } else {
+                tracing::debug!("verify task: token no longer owns action, dropping final status");
             }
         });
 
@@ -572,11 +643,15 @@ impl Device {
         let sender = header.sender().map(|s| s.to_string());
         let _user = self.ensure_claim(sender.as_deref()).await?;
         let mut state = self.state.lock().await;
-        if state.action_in_progress != Some("verify") {
-            return Err(FprintError::NoActionInProgress("no verify in progress".into()));
+        match state.action {
+            Some(ActionToken { kind: ActionKind::Verify, .. }) => {
+                state.action = None;
+                state.finger_needed = false;
+                state.finger_present = false;
+                Ok(())
+            }
+            _ => Err(FprintError::NoActionInProgress("no verify in progress".into())),
         }
-        state.action_in_progress = None;
-        Ok(())
     }
 
     async fn enroll_start(
@@ -588,54 +663,49 @@ impl Device {
         validate_finger(&finger_name, false)?;
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
-        {
+
+        let my_token = {
             let mut state = self.state.lock().await;
-            if let Some(action) = state.action_in_progress {
+            if let Some(t) = state.action {
                 return Err(FprintError::AlreadyInUse(format!(
                     "{} already in progress",
-                    action
+                    t.kind.as_str()
                 )));
             }
-            state.action_in_progress = Some("enroll");
-        }
+            state.start_action(ActionKind::Enroll)
+        };
 
-        // From here on, ANY error path must clear action_in_progress before
-        // returning — otherwise the device wedges into "enroll" forever and
-        // every subsequent Verify/Enroll fails with AlreadyInUse until the
-        // claimer disconnects.
-        if let Some(existing) = self.storage.get_slot(&user, &finger_name).await {
-            tracing::info!(user = %user, finger = %finger_name, slot = existing, "re-enrolling, freeing old slot");
-            if let Err(e) = self.sensor.delete(existing).await {
-                tracing::warn!("delete old slot failed: {}", e);
+        // Re-enroll strategy: if the user already has THIS finger enrolled,
+        // reuse the same slot. The R503's storeModel() unconditionally
+        // overwrites the slot at the END of enroll, only after createModel
+        // succeeds — so a failed re-enroll leaves the previous good template
+        // intact, and a successful re-enroll cleanly replaces it. This avoids
+        // the "wipe old enrollment before knowing the new one works" foot-gun
+        // and removes the ghost-template window we'd open by pre-deleting.
+        let slot = match self.storage.get_slot(&user, &finger_name).await {
+            Some(existing) => {
+                tracing::info!(user = %user, finger = %finger_name, slot = existing, "re-enrolling (reusing existing slot)");
+                existing
             }
-            if let Err(e) = self.storage.remove_finger(&user, &finger_name).await {
-                self.state.lock().await.action_in_progress = None;
-                return Err(e.into());
-            }
-        }
-
-        let slot = match self.storage.allocate_slot().await {
-            Ok(s) => s,
-            Err(StorageError::NoFreeSlot(_)) => {
-                // Spec compliance: this is the upstream FP_DEVICE_ERROR_DATA_FULL
-                // case. Don't fail EnrollStart synchronously — return Ok and emit
-                // the terminal status async, so spec-aware clients (kcm_users,
-                // gnome-control-center) get the "enroll-data-full" signal they're
-                // listening for instead of an opaque Internal error.
-                tracing::warn!(user = %user, finger = %finger_name, "sensor flash full — emitting enroll-data-full");
-                self.state.lock().await.action_in_progress = None;
-                let owned_emitter = emitter.to_owned();
-                tokio::spawn(async move {
-                    Device::enroll_status(&owned_emitter, "enroll-data-full", true)
+            None => match self.storage.allocate_slot().await {
+                Ok(s) => s,
+                Err(StorageError::NoFreeSlot(_)) => {
+                    // Upstream FP_DEVICE_ERROR_DATA_FULL → status signal.
+                    // Emit synchronously BEFORE clearing the action slot so a
+                    // racing EnrollStart can't pre-empt and have our orphan
+                    // signal land against its session.
+                    tracing::warn!(user = %user, finger = %finger_name, "sensor flash full — emitting enroll-data-full");
+                    Device::enroll_status(&emitter, "enroll-data-full", true)
                         .await
                         .ok();
-                });
-                return Ok(());
-            }
-            Err(e) => {
-                self.state.lock().await.action_in_progress = None;
-                return Err(e.into());
-            }
+                    self.state.lock().await.end_action_if_owner(my_token);
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.state.lock().await.end_action_if_owner(my_token);
+                    return Err(e.into());
+                }
+            },
         };
         tracing::info!(user = %user, finger = %finger_name, slot, "EnrollStart");
         {
@@ -645,46 +715,60 @@ impl Device {
         }
         let owned_emitter = emitter.to_owned();
 
-        // Channel for progress lines from the sensor worker. Drives both the
-        // enroll-stage-passed signal AND the finger-present/finger-needed
-        // properties (firmware emits place_finger / remove_finger / place_again
-        // — see `update_finger_state_from_progress` for the mapping).
-        let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let progress_emitter = owned_emitter.clone();
-        let state_for_progress = self.state.clone();
-        let progress_handle = tokio::spawn(async move {
-            while let Some(msg) = prog_rx.recv().await {
-                tracing::debug!(progress = %msg, "enroll progress");
-                update_finger_state_from_progress(&state_for_progress, &msg).await;
-                let low = msg.to_lowercase();
-                // fprintd consumers expect enroll-stage-passed between captures.
-                if low.contains("remove_finger") || low.contains("remove finger") {
-                    Device::enroll_status(&progress_emitter, "enroll-stage-passed", false)
-                        .await
-                        .ok();
-                }
-            }
-        });
-
         let sensor = self.sensor.clone();
         let storage = self.storage.clone();
         let state = self.state.clone();
         let user_for_task = user.clone();
         let finger_for_task = finger_name.clone();
         tokio::spawn(async move {
-            let result = sensor.enroll(slot, Some(prog_tx)).await;
-            progress_handle.abort();
-            {
-                let mut s = state.lock().await;
-                s.finger_needed = false;
-                s.finger_present = false;
-                // Only clear if this enroll still owns the slot — EnrollStop
-                // (or a claimer crash) may have released the claim and a
-                // successor verify/enroll could have already taken over.
-                if s.action_in_progress == Some("enroll") {
-                    s.action_in_progress = None;
+            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let enroll_fut = sensor.enroll(slot, Some(prog_tx.clone()));
+            tokio::pin!(enroll_fut);
+
+            // Drive the enroll + interleave progress in one task. select! means
+            // there's no separate receiver task to leak and no abort-races-
+            // queued-message: each PROGRESS line is consumed before we hand
+            // control to the next branch.
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    Some(msg) = prog_rx.recv() => {
+                        tracing::debug!(progress = %msg, "enroll progress");
+                        update_finger_state_from_progress(&state, &msg).await;
+                        let low = msg.to_lowercase();
+                        if low.contains("remove_finger") || low.contains("remove finger") {
+                            Device::enroll_status(&owned_emitter, "enroll-stage-passed", false)
+                                .await
+                                .ok();
+                        }
+                    }
+                    result = &mut enroll_fut => break result,
+                }
+            };
+            // Drain any trailing PROGRESS lines that landed after enroll done.
+            drop(prog_tx);
+            let drain_deadline = tokio::time::sleep(std::time::Duration::from_millis(50));
+            tokio::pin!(drain_deadline);
+            loop {
+                tokio::select! {
+                    _ = &mut drain_deadline => break,
+                    msg = prog_rx.recv() => match msg {
+                        Some(m) => update_finger_state_from_progress(&state, &m).await,
+                        None => break,
+                    }
                 }
             }
+
+            // Epoch-guarded cleanup. If a successor (or EnrollStop / claimer
+            // disconnect) replaced our token, drop the result silently — the
+            // original caller is no longer listening and we mustn't stomp the
+            // successor's state or emit a stale terminal signal.
+            let still_ours = state.lock().await.end_action_if_owner(my_token);
+            if !still_ours {
+                tracing::debug!("enroll task: token no longer owns action, dropping final status");
+                return;
+            }
+
             match result {
                 Ok(_actual_slot) => {
                     if let Err(e) = storage
@@ -727,11 +811,15 @@ impl Device {
         let sender = header.sender().map(|s| s.to_string());
         let _user = self.ensure_claim(sender.as_deref()).await?;
         let mut state = self.state.lock().await;
-        if state.action_in_progress != Some("enroll") {
-            return Err(FprintError::NoActionInProgress("no enroll in progress".into()));
+        match state.action {
+            Some(ActionToken { kind: ActionKind::Enroll, .. }) => {
+                state.action = None;
+                state.finger_needed = false;
+                state.finger_present = false;
+                Ok(())
+            }
+            _ => Err(FprintError::NoActionInProgress("no enroll in progress".into())),
         }
-        state.action_in_progress = None;
-        Ok(())
     }
 
     // ----- Signals -----
