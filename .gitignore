@@ -1,0 +1,18 @@
+# Rust
+target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# Arduino build artifacts (when using arduino-cli)
+firmware/r503fp/build/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.fleet/
+
+# Local-only state we don't want to publish
+*.local
