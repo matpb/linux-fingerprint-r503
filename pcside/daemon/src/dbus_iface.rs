@@ -617,8 +617,14 @@ impl Device {
                         .ok();
                 }
                 Err(e) => {
-                    tracing::warn!("enroll error: {}", e);
-                    Device::enroll_status(&owned_emitter, "enroll-failed", true)
+                    let status = if crate::sensor_actor::is_fatal_io(&e) {
+                        tracing::warn!("enroll disconnected: {}", e);
+                        "enroll-disconnected"
+                    } else {
+                        tracing::warn!("enroll error: {}", e);
+                        "enroll-failed"
+                    };
+                    Device::enroll_status(&owned_emitter, status, true)
                         .await
                         .ok();
                 }

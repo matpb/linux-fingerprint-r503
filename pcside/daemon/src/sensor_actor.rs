@@ -47,9 +47,15 @@ enum SensorRequest {
 /// - `NeedsReopen(req)`: the operation hit a fatal I/O error before sending
 ///   a result; the worker should drop the sensor, reopen, and retry the
 ///   returned request so the caller still sees a single response.
+/// - `DoneAfterFatal`: the operation hit a fatal I/O error and we already
+///   sent the error to the caller (used for `Enroll`, where transparently
+///   retrying would silently restart the multi-press flow without the user
+///   knowing their previous presses were discarded). The sensor must still
+///   be marked for reopen so the next request gets a fresh handle.
 enum HandleOutcome {
     Done,
     NeedsReopen(SensorRequest),
+    DoneAfterFatal,
 }
 
 /// An I/O error that means the underlying serial port is no longer usable —
@@ -160,6 +166,13 @@ impl SensorActor {
                         let s = sensor.as_mut().unwrap();
                         match Self::handle_request(s, req) {
                             HandleOutcome::Done => break,
+                            HandleOutcome::DoneAfterFatal => {
+                                tracing::warn!(
+                                    "sensor I/O error during multi-step op — error sent to caller, will reopen on next request"
+                                );
+                                sensor = None;
+                                break;
+                            }
                             HandleOutcome::NeedsReopen(returned_req) => {
                                 tracing::warn!(
                                     "sensor I/O error — will reopen and retry the request"
@@ -231,15 +244,19 @@ impl SensorActor {
             SensorRequest::Enroll { slot, progress, done } => {
                 install_progress(sensor, &progress);
                 let result = sensor.enroll(slot);
-                if matches!(&result, Err(e) if is_fatal_io(e)) {
-                    return HandleOutcome::NeedsReopen(SensorRequest::Enroll {
-                        slot,
-                        progress,
-                        done,
-                    });
-                }
+                let fatal = matches!(&result, Err(e) if is_fatal_io(e));
                 let _ = done.send(result);
-                HandleOutcome::Done
+                // Enroll is a multi-press flow — silently retrying after a
+                // reopen would discard the user's earlier presses without
+                // telling them, then sit there waiting for the first press
+                // of a fresh attempt. Surface the IO error and let the
+                // D-Bus layer emit enroll-disconnected so the UI can prompt
+                // the user to restart explicitly.
+                if fatal {
+                    HandleOutcome::DoneAfterFatal
+                } else {
+                    HandleOutcome::Done
+                }
             }
             SensorRequest::Verify { progress, done } => {
                 install_progress(sensor, &progress);
