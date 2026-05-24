@@ -154,22 +154,34 @@ impl R503 {
                 Err(e) => return Err(SensorError::Io(e)),
             }
         }
-        self.rx_buf.clear();
-        let _ = self.port.clear(serialport::ClearBuffer::Input);
-
         // Phase 2 — retry pings until we hear "OK pong" or run out of budget.
         // A ping sent while setup() is still running (cold boot) gets either
         // queued past the boot banner or lost; the next one always lands once
         // the main loop starts. Per-ping wait is 1s, the outer deadline caps
         // total attempts.
+        //
+        // Critical: clear both rx_buf and the kernel input queue BEFORE each
+        // attempt. Otherwise, a previous attempt's "OK pong" that arrived late
+        // (after we'd given up on it) gets consumed by the next attempt's
+        // read_line, and the queue still holds an unmatched response that will
+        // bleed into the next caller's execute() — observable as `info` parsing
+        // "OK pong" and returning a SensorInfo full of zeros.
         while Instant::now() < deadline {
+            self.rx_buf.clear();
+            let _ = self.port.clear(serialport::ClearBuffer::Input);
             self.port.write_all(b"ping\n")?;
             self.port.flush()?;
             let per_attempt = Instant::now() + Duration::from_secs(1);
             let attempt_deadline = per_attempt.min(deadline);
             loop {
                 match self.read_line(attempt_deadline)? {
-                    Some(l) if l == "OK pong" => return Ok(()),
+                    Some(l) if l == "OK pong" => {
+                        // Belt-and-suspenders: discard anything queued behind
+                        // the pong before handing control back.
+                        self.rx_buf.clear();
+                        let _ = self.port.clear(serialport::ClearBuffer::Input);
+                        return Ok(());
+                    }
                     Some(_) => continue,
                     None => break, // attempt timed out — outer loop will retry
                 }
@@ -219,7 +231,15 @@ impl R503 {
 
     /// Send a command, stream PROGRESS lines through `on_progress`, return the
     /// final OK/ERR line. Times out if neither arrives within `timeout_ms`.
+    ///
+    /// Discards anything left in the input buffer first: a previous command
+    /// that hit Rust-side timeout may have left a late OK/ERR line in the
+    /// kernel queue or in `rx_buf`, and we don't want it to satisfy the next
+    /// command. (The firmware is single-threaded and won't reply out of order,
+    /// so dropping stale bytes is always safe.)
     fn execute(&mut self, cmd: &str, timeout_ms: u64) -> Result<String, SensorError> {
+        self.rx_buf.clear();
+        let _ = self.port.clear(serialport::ClearBuffer::Input);
         self.send(cmd)?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
@@ -273,9 +293,13 @@ impl R503 {
     pub fn info(&mut self) -> Result<SensorInfo, SensorError> {
         let body = Self::expect_ok(self.execute("info", TIMEOUT_INFO_MS)?)?;
         let kv = Self::parse_kv(&body);
+        // `capacity` is required — a missing/garbled value would silently
+        // collapse to 0, which then makes allocate_slot() return NoFreeSlot for
+        // every enroll. Treat it as a protocol error so the daemon refuses to
+        // start instead of failing every later enroll with a confusing reason.
         Ok(SensorInfo {
             fw: kv.get("fw").cloned().unwrap_or_default(),
-            capacity: Self::parse_field(&kv, "capacity").unwrap_or(0),
+            capacity: Self::parse_field(&kv, "capacity")?,
             enrolled: Self::parse_field(&kv, "enrolled").unwrap_or(0),
             sysid: kv.get("sysid").cloned().unwrap_or_default(),
             security: Self::parse_field(&kv, "security").unwrap_or(0),
