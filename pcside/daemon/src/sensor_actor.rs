@@ -128,18 +128,20 @@ impl SensorActor {
                         // /dev/r503 may not exist for ~100-300ms. Retry a few
                         // times with exponential backoff before giving up.
                         //
-                        // sync_timeout is shorter than the initial-open path:
-                        // initial open faces a DTR-on-open Arduino reset that
-                        // takes ~2.5s of boot output before the firmware is
-                        // ready, so 8s is appropriate there. Reopen targets an
-                        // already-running firmware that responds to ping in
-                        // <50ms; 1.5s leaves margin for a slow ping retry
-                        // without burning the worker on an unresponsive device
-                        // past the libdbus 25s method-call timeout (4 attempts
-                        // × 1.5s + ~1s backoff ≈ 7s worst case).
+                        // sync_timeout matches the initial-open path (8s).
+                        // serialport::open() toggles DTR on every open on
+                        // Linux cdc-acm/ch340, which RESETS the Arduino and
+                        // forces a fresh ~2.5s setup() boot before the
+                        // firmware is ready to ping. A shorter timeout
+                        // expires mid-boot and every attempt fails forever
+                        // (observed on Mat's Uno R3 after USB unplug+replug:
+                        // onboard LED blinking once per reset, sync always
+                        // timing out). Failed opens (path missing during
+                        // udev race) still fail fast in <1ms, so the typical
+                        // wall time is one boot cycle plus backoff, not 4×8s.
                         if sensor.is_none() {
                             const REOPEN_ATTEMPTS: u32 = 4;
-                            const REOPEN_SYNC_TIMEOUT: Duration = Duration::from_millis(1500);
+                            const REOPEN_SYNC_TIMEOUT: Duration = Duration::from_secs(8);
                             let mut last_err: Option<SensorError> = None;
                             for attempt in 0..REOPEN_ATTEMPTS {
                                 if attempt > 0 {

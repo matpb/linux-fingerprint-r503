@@ -420,13 +420,31 @@ impl Device {
             username
         };
         let mut state = self.state.lock().await;
+        // Single-user pragma: if the device is already claimed for the SAME
+        // user and no operation is in flight, allow the new caller to take
+        // over. Without this, opening KDE Settings (which claims and holds
+        // the device for the lifetime of the dialog) blocks every CLI
+        // fprintd-verify/sudo finger-auth from the same desktop session
+        // until the dialog is closed. A different-user claim, or an
+        // in-flight enroll/verify, still fails AlreadyInUse.
         if let Some(existing) = &state.claimed_by {
-            return Err(FprintError::AlreadyInUse(format!(
-                "already claimed by {}",
-                existing
-            )));
+            if existing != &user {
+                return Err(FprintError::AlreadyInUse(format!(
+                    "already claimed by {}",
+                    existing
+                )));
+            }
+            if state.action.is_some() {
+                return Err(FprintError::AlreadyInUse(format!(
+                    "{} in progress for {}",
+                    state.action.unwrap().kind.as_str(),
+                    existing
+                )));
+            }
+            tracing::info!(user = %user, sender = ?sender, "Device re-claimed (same user, no op in flight)");
+        } else {
+            tracing::info!(user = %user, sender = ?sender, "Device claimed");
         }
-        tracing::info!(user = %user, sender = ?sender, "Device claimed");
         state.claimed_by = Some(user);
         state.claim_sender = sender;
         Ok(())
