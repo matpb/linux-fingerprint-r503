@@ -14,11 +14,14 @@ echo ">>> stopping + disabling r503d.service"
 systemctl stop r503d.service 2>/dev/null || true
 systemctl disable r503d.service 2>/dev/null || true
 
-echo ">>> removing r503d.service unit + binary + D-Bus override + udev rule"
+echo ">>> removing r503d.service unit + binary + D-Bus override + udev rule + polkit policy + bus policy"
 rm -f /etc/systemd/system/r503d.service
 rm -f /usr/local/bin/r503d
 rm -f /usr/local/share/dbus-1/system-services/net.reactivated.Fprint.service
 rm -f /etc/udev/rules.d/70-r503.rules
+rm -f /usr/share/polkit-1/actions/net.reactivated.fprint.device.r503d.policy
+rm -f /usr/share/polkit-1/actions/net.reactivated.Fprint.policy  # legacy filename pre-S1 rename
+rm -f /etc/dbus-1/system.d/net.reactivated.Fprint.conf
 
 echo ">>> reloading udev (drops the /dev/r503 symlink)"
 udevadm control --reload

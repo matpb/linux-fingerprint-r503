@@ -279,8 +279,20 @@ Full threat model with rationale: [`SPEC.md` §13.1](SPEC.md).
 
 ## Limitations
 
-- **Single-user.** The daemon trusts every D-Bus caller. Don't expose
-  this on a shared workstation. Add polkit if you need that.
+- **Multi-user works, but only for `wheel` members.** Caller identity is
+  checked on every D-Bus method that takes a `username` (`Claim`,
+  `EnrollStart`, `VerifyStart`, `ListEnrolledFingers`,
+  `DeleteEnrolledFingers`); self-requests and `uid 0` (PAM) succeed
+  silently, cross-user from a non-root caller is denied with
+  `net.reactivated.Fprint.Error.PermissionDenied`. The system bus policy
+  further restricts which accounts can even start a conversation: only
+  `root` and `wheel` members reach the daemon, everyone else gets
+  `org.freedesktop.DBus.Error.AccessDenied` at the broker layer.
+  Need cross-user enroll? Become root: `sudo fprintd-enroll target-user`.
+  Need to loosen the cross-user gate for a kiosk / multi-user lab? Drop
+  a JS rule into `/etc/polkit-1/rules.d/` targeting
+  [`net.reactivated.fprint.device.setusername`](https://gitlab.freedesktop.org/libfprint/fprintd/-/blob/master/src/net.reactivated.fprint.device.policy.in)
+  — the action name mirrors upstream fprintd verbatim.
 - **One reader.** The daemon exposes a single Device object on D-Bus.
   Multi-reader setups need an extension to the Manager.
 - **No `PropertiesChanged` emit** for the `finger-present` / `finger-needed`

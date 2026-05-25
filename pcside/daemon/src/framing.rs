@@ -63,7 +63,13 @@ pub fn verify_command<'a>(
     let (counter, cmd_line, claimed) = parse_command(line)?;
     let mac_input = format!("CMD {} {}", counter, cmd_line);
     let expected = crypto::siphash24(key, mac_input.as_bytes());
-    if expected != claimed {
+    // XOR + zero-check rather than `!=`: the equality compare on Rust u64s
+    // is allowed to short-circuit byte-by-byte in theory, even if today's
+    // codegen on the platforms we care about doesn't. The XOR collapses
+    // both 8-byte MACs to a single u64 difference whose computation is
+    // unconditionally constant-time. Audit §P1-3 / §S5.1.
+    let diff = expected ^ claimed;
+    if diff != 0 {
         return Err(FramingError::MacMismatch);
     }
     Ok((counter, cmd_line))
@@ -111,7 +117,9 @@ pub fn verify_response<'a>(
     let (counter, seq, body, claimed) = parse_response(line)?;
     let mac_input = format!("RSP {} {} {}", counter, seq, body);
     let expected = crypto::siphash24(key, mac_input.as_bytes());
-    if expected != claimed {
+    // See `verify_command` for the constant-time-XOR rationale (§S5.1).
+    let diff = expected ^ claimed;
+    if diff != 0 {
         return Err(FramingError::MacMismatch);
     }
     Ok((counter, seq, body))

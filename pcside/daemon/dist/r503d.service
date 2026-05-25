@@ -35,5 +35,22 @@ MemoryDenyWriteExecute=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
+# Network / clock / host isolation (§S7 / audit §P2-1). Daemon has zero
+# network surface (talks D-Bus over AF_UNIX, sensor over serial char dev),
+# never changes wall-clock or hostname, never reads kernel logs.
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+PrivateNetwork=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+
+# Drop the capability bounding (and via systemd semantics, the permitted
+# + inheritable sets) to empty. The daemon runs as root for file/device
+# permissions, but doesn't need any capabilities once started — file ops
+# on /var/lib/r503d, opening /dev/r503, and connecting to the system bus
+# all work on UID+DAC alone.
+CapabilityBoundingSet=
+
 [Install]
 WantedBy=multi-user.target
