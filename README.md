@@ -115,9 +115,18 @@ sudo bash pcside/daemon/dist/install.sh
 That script:
 
 - installs `target/release/r503d` to `/usr/local/bin/r503d`
+- creates `/var/lib/r503d/` (mode 0700 root:root) for the key, state, and
+  user-slot registry
 - writes the udev rule that exposes the Arduino as `/dev/r503`
 - installs the systemd unit (`/etc/systemd/system/r503d.service`)
 - overrides the D-Bus autolaunch entry for `net.reactivated.Fprint`
+- installs the polkit action
+  (`/usr/share/polkit-1/actions/net.reactivated.fprint.device.r503d.policy`)
+  used by the caller-identity gate
+- installs the restrictive system bus policy
+  (`/etc/dbus-1/system.d/net.reactivated.Fprint.conf`) — only `root` and
+  `wheel` members can talk to the daemon; everyone else hits
+  `AccessDenied` at the broker, before the daemon sees the call
 - stops and masks upstream `fprintd.service`
 - starts `r503d.service`
 
@@ -140,7 +149,11 @@ sudo systemctl start r503d
 
 The opt-in file (`/etc/r503d/allow-pair`) exists to defeat an attacker
 racing to your desk with their own Nano — pairing without root is
-impossible. The file is auto-deleted by `r503d --pair` on success.
+impossible. `r503d --pair` deletes the marker **before** sending the
+key to the Nano: if the host crashes between Nano-side commit and
+host-side persistence, the gate is already closed, so the next pair
+attempt requires admin to `touch` the marker again. A pre-send bail
+(no marker, or "already paired") leaves the marker intact for retry.
 
 Check the pairing state anytime:
 
@@ -246,7 +259,9 @@ firmware/*                   Diagnostic / development sketches (ping, loopback, 
 pcside/daemon/               Rust daemon (the fprintd replacement)
 pcside/daemon/src/{crypto,framing,keystore,state,pairing}.rs
                              v2 wire protocol implementation
-pcside/daemon/dist/          udev rule, systemd unit, install scripts
+pcside/daemon/src/auth.rs    caller-identity gating for D-Bus methods
+pcside/daemon/dist/          udev rule, systemd unit, polkit + bus policy,
+                             install scripts
 docs/                        Decision logs + troubleshooting
 SPEC.md                      Full architecture + protocol spec (§13 = v2 auth)
 ```
@@ -262,6 +277,11 @@ not against nation-states or hardware attackers with labs.
 - Local process injecting fake match responses on `/dev/r503` (same).
 - Replay of recorded `OK match=...` frames in a future session.
 - Bit-flip tampering of any frame field (constant-time MAC compare).
+- Cross-user fingerprint plant / wipe / enumeration by a local non-root
+  user (e.g. `mallory` calling `Claim "root"` then enrolling her own
+  finger) — caller identity is checked on every `username`-taking D-Bus
+  method, and the system bus policy denies non-`wheel` callers at the
+  broker layer.
 
 **Not defended:**
 - Host root compromise (key is in `/var/lib/r503d/key`, `0600 root:root`).
