@@ -16,28 +16,27 @@ fi
 DIST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$(cd -- "$DIST_DIR/.." && pwd)"
 BINARY="$BUILD_DIR/target/release/r503d"
-SESSION_STORAGE="${SUDO_USER:+/home/$SUDO_USER}/.local/state/r503d/users.json"
 
 if [[ ! -x "$BINARY" ]]; then
     echo "missing release binary at $BINARY — run 'cargo build --release' first" >&2
     exit 1
 fi
 
-echo ">>> [1/10] installing r503d binary -> /usr/local/bin/r503d"
+echo ">>> [1/9] installing r503d binary -> /usr/local/bin/r503d"
 install -m 0755 -o root -g root "$BINARY" /usr/local/bin/r503d
 
-echo ">>> [2/10] creating /var/lib/r503d state dir"
+echo ">>> [2/9] creating /var/lib/r503d state dir"
 install -d -m 0700 -o root -g root /var/lib/r503d
 
-# Preserve sensor-flash slot mapping from session-bus testing, if present.
-if [[ -f "$SESSION_STORAGE" && ! -f /var/lib/r503d/users.json ]]; then
-    echo ">>> [3/10] seeding /var/lib/r503d/users.json from $SESSION_STORAGE"
-    install -m 0600 -o root -g root "$SESSION_STORAGE" /var/lib/r503d/users.json
-else
-    echo ">>> [3/10] /var/lib/r503d/users.json already exists or no session seed — skipping"
-fi
+# Note: this installer does NOT seed /var/lib/r503d/users.json from any
+# session-bus testing state. Previously it copied
+# ~$SUDO_USER/.local/state/r503d/users.json over when no system file existed,
+# which is an unvalidated promotion of dev mappings to system truth (audit
+# §P1-5). If you genuinely want to carry session-mode enrollments forward,
+# `cp` the file explicitly and double-check the usernames against
+# `getpwnam` before re-pairing.
 
-echo ">>> [4/10] installing udev rule -> /etc/udev/rules.d/70-r503.rules"
+echo ">>> [3/9] installing udev rule -> /etc/udev/rules.d/70-r503.rules"
 install -m 0644 -o root -g root "$DIST_DIR/70-r503.rules" /etc/udev/rules.d/70-r503.rules
 udevadm control --reload
 udevadm trigger --subsystem-match=tty
@@ -49,27 +48,27 @@ else
     echo "     daemon will fall back to scanning /dev/ttyACM* and /dev/ttyUSB*)"
 fi
 
-echo ">>> [5/10] installing systemd unit -> /etc/systemd/system/r503d.service"
+echo ">>> [4/9] installing systemd unit -> /etc/systemd/system/r503d.service"
 install -m 0644 -o root -g root "$DIST_DIR/r503d.service" /etc/systemd/system/r503d.service
 
-echo ">>> [6/10] overriding D-Bus autolaunch -> /usr/local/share/dbus-1/system-services/"
+echo ">>> [5/9] overriding D-Bus autolaunch -> /usr/local/share/dbus-1/system-services/"
 install -d -m 0755 /usr/local/share/dbus-1/system-services
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.Fprint.service" \
     /usr/local/share/dbus-1/system-services/net.reactivated.Fprint.service
 
-echo ">>> [7/10] installing polkit policy -> /usr/share/polkit-1/actions/"
+echo ">>> [6/9] installing polkit policy -> /usr/share/polkit-1/actions/"
 install -d -m 0755 /usr/share/polkit-1/actions
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.fprint.device.r503d.policy" \
     /usr/share/polkit-1/actions/net.reactivated.fprint.device.r503d.policy
 
-echo ">>> [8/10] systemctl daemon-reload"
+echo ">>> [7/9] systemctl daemon-reload"
 systemctl daemon-reload
 
-echo ">>> [9/10] stopping + masking fprintd.service"
+echo ">>> [8/9] stopping + masking fprintd.service"
 systemctl stop fprintd.service 2>/dev/null || true
 systemctl mask fprintd.service
 
-echo ">>> [10/10] enabling + starting r503d.service"
+echo ">>> [9/9] enabling + starting r503d.service"
 systemctl enable r503d.service
 systemctl restart r503d.service
 
