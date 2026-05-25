@@ -8,6 +8,9 @@
 
 #include <SoftwareSerial.h>
 #include <Adafruit_Fingerprint.h>
+#include "siphash.h"
+#include "framing.h"
+#include "eeprom.h"
 
 const long PC_BAUD = 115200;
 const long FP_BAUD = 57600;
@@ -20,29 +23,90 @@ Adafruit_Fingerprint finger(&sensorSerial);
 
 String inbuf;
 
+// ---------- v2 framed-output plumbing (Milestone E) ----------
+//
+// During a framed dispatch, all handler-internal output goes through `g_out`
+// which points at `g_framer`. The framer buffers one line at a time and emits
+// a `R <ctr> <seq> <body> M <mac>` frame each time the handler calls println()
+// or writes a '\n'. Outside framed dispatch, `g_out` points at `&Serial` so
+// the same handlers also work for unframed (pre-pair) responses.
+
+class LineFramer : public Print {
+public:
+  void reset() { pos = 0; }
+  void flush_line(); // forward decl; body defined after the helpers
+  size_t write(uint8_t c) override {
+    if (c == '\n') {
+      flush_line();
+    } else if (c == '\r') {
+      // strip — Arduino's Print::println sends "\r\n"; we only frame on '\n'
+    } else if (pos < sizeof(line) - 1) {
+      line[pos++] = (char)c;
+    }
+    return 1;
+  }
+private:
+  // 128 covers any v2 response body (~80 chars max: emitInfo's full line is
+  // the worst case). LineFramer is a global g_framer instance, so this lives
+  // in BSS — no stack cost.
+  char line[128];
+  size_t pos = 0;
+};
+
+LineFramer g_framer;
+Print* g_out = &Serial;
+
+// Session state for a single framed command in flight. Set by process_line()
+// after MAC + counter checks succeed; consumed by g_framer.flush_line().
+uint8_t  g_session_key[16];
+uint64_t g_session_counter = 0;
+uint32_t g_session_seq = 0;
+
+void LineFramer::flush_line() {
+  if (pos == 0) return;
+  line[pos] = 0;
+  // 160 bytes covers the worst realistic frame: "R <20> <10> <100-body> M <16>"
+  // ≈ 150 chars. Stack-local is fine after we trimmed the per-call mac buffers
+  // to 128 bytes (see framing.h compute_*_mac) and removed the test commands
+  // that had bigger transient buffers.
+  char out[160];
+  size_t n = r503::encode_response_frame(
+      g_session_key, g_session_counter, g_session_seq,
+      line, pos, out, sizeof(out));
+  if (n > 0) {
+    Serial.println(out);
+  } else {
+    // The body itself overflowed our frame buffer. Emit a best-effort
+    // unframed warning — daemon will see it and mark sensor unhealthy.
+    Serial.println(F("ERR encode_overflow"));
+  }
+  g_session_seq++;
+  pos = 0;
+}
+
 void emitInfo() {
   if (!finger.verifyPassword()) {
-    Serial.println(F("ERR sensor_unreachable"));
+    g_out->println(F("ERR sensor_unreachable"));
     return;
   }
   finger.getParameters();
   finger.getTemplateCount();
-  Serial.print(F("OK fw=0.3 capacity="));
-  Serial.print(finger.capacity);
-  Serial.print(F(" enrolled="));
-  Serial.print(finger.templateCount);
-  Serial.print(F(" sysid=0x"));
-  Serial.print(finger.system_id, HEX);
-  Serial.print(F(" security="));
-  Serial.print(finger.security_level);
-  Serial.print(F(" device_addr=0x"));
-  Serial.println(finger.device_addr, HEX);
+  g_out->print(F("OK fw=1.0 capacity="));
+  g_out->print(finger.capacity);
+  g_out->print(F(" enrolled="));
+  g_out->print(finger.templateCount);
+  g_out->print(F(" sysid=0x"));
+  g_out->print(finger.system_id, HEX);
+  g_out->print(F(" security="));
+  g_out->print(finger.security_level);
+  g_out->print(F(" device_addr=0x"));
+  g_out->println(finger.device_addr, HEX);
 }
 
 void emitCount() {
   finger.getTemplateCount();
-  Serial.print(F("OK count="));
-  Serial.println(finger.templateCount);
+  g_out->print(F("OK count="));
+  g_out->println(finger.templateCount);
 }
 
 uint8_t waitForFingerCapture(uint16_t timeoutMs) {
@@ -68,72 +132,213 @@ uint8_t waitForFingerRemoval(uint16_t timeoutMs) {
 
 void handleEnroll(int slot) {
   if (slot < 0 || slot >= finger.capacity) {
-    Serial.println(F("ERR bad_args slot_out_of_range"));
+    g_out->println(F("ERR bad_args slot_out_of_range"));
     return;
   }
   finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_PURPLE);
 
-  Serial.println(F("PROGRESS place_finger"));
+  g_out->println(F("PROGRESS place_finger"));
   uint8_t p = waitForFingerCapture(15000);
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.print(F("ERR capture_failed=")); Serial.println(p); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR capture_failed=")); g_out->println(p); return; }
   p = finger.image2Tz(1);
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.print(F("ERR image2tz_failed=")); Serial.println(p); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR image2tz_failed=")); g_out->println(p); return; }
 
-  Serial.println(F("PROGRESS remove_finger"));
+  g_out->println(F("PROGRESS remove_finger"));
   p = waitForFingerRemoval(10000);
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.println(F("ERR finger_not_removed")); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->println(F("ERR finger_not_removed")); return; }
 
-  Serial.println(F("PROGRESS place_again"));
+  g_out->println(F("PROGRESS place_again"));
   p = waitForFingerCapture(15000);
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.print(F("ERR second_capture_failed=")); Serial.println(p); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR second_capture_failed=")); g_out->println(p); return; }
   p = finger.image2Tz(2);
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.print(F("ERR image2tz_failed=")); Serial.println(p); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR image2tz_failed=")); g_out->println(p); return; }
 
   p = finger.createModel();
-  if (p == FINGERPRINT_ENROLLMISMATCH) { finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_RED, 5); Serial.println(F("ERR mismatch")); return; }
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.print(F("ERR create_model_failed=")); Serial.println(p); return; }
+  if (p == FINGERPRINT_ENROLLMISMATCH) { finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_RED, 5); g_out->println(F("ERR mismatch")); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR create_model_failed=")); g_out->println(p); return; }
 
   p = finger.storeModel((uint16_t)slot);
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.print(F("ERR store_failed=")); Serial.println(p); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR store_failed=")); g_out->println(p); return; }
 
   finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_BLUE, 5);
-  Serial.print(F("OK enrolled="));
-  Serial.println(slot);
+  g_out->print(F("OK enrolled="));
+  g_out->println(slot);
 }
 
 void handleVerify() {
   finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE);
-  Serial.println(F("PROGRESS place_finger"));
+  g_out->println(F("PROGRESS place_finger"));
   uint8_t p = waitForFingerCapture(10000);
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.println(F("ERR timeout")); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->println(F("ERR timeout")); return; }
   p = finger.image2Tz();
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.println(F("ERR poor_quality")); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->println(F("ERR poor_quality")); return; }
   p = finger.fingerSearch();
   if (p == FINGERPRINT_NOTFOUND) {
     finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_RED, 3);
-    Serial.println(F("ERR no_match"));
+    g_out->println(F("ERR no_match"));
     return;
   }
-  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.print(F("ERR search_failed=")); Serial.println(p); return; }
+  if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR search_failed=")); g_out->println(p); return; }
   finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_BLUE, 3);
-  Serial.print(F("OK match="));
-  Serial.print(finger.fingerID);
-  Serial.print(F(" confidence="));
-  Serial.println(finger.confidence);
+  g_out->print(F("OK match="));
+  g_out->print(finger.fingerID);
+  g_out->print(F(" confidence="));
+  g_out->println(finger.confidence);
 }
 
 void handleDelete(int slot) {
-  if (slot < 0 || slot >= finger.capacity) { Serial.println(F("ERR bad_args slot_out_of_range")); return; }
+  if (slot < 0 || slot >= finger.capacity) { g_out->println(F("ERR bad_args slot_out_of_range")); return; }
   uint8_t p = finger.deleteModel((uint16_t)slot);
-  if (p == FINGERPRINT_OK) { Serial.print(F("OK deleted=")); Serial.println(slot); }
-  else { Serial.print(F("ERR delete_failed=")); Serial.println(p); }
+  if (p == FINGERPRINT_OK) { g_out->print(F("OK deleted=")); g_out->println(slot); }
+  else { g_out->print(F("ERR delete_failed=")); g_out->println(p); }
 }
 
 void handleClear(bool confirmed) {
-  if (!confirmed) { Serial.println(F("ERR confirmation_required (use: clear confirm)")); return; }
+  if (!confirmed) { g_out->println(F("ERR confirmation_required (use: clear confirm)")); return; }
   uint8_t p = finger.emptyDatabase();
-  if (p == FINGERPRINT_OK) Serial.println(F("OK cleared"));
-  else { Serial.print(F("ERR clear_failed=")); Serial.println(p); }
+  if (p == FINGERPRINT_OK) g_out->println(F("OK cleared"));
+  else { g_out->print(F("ERR clear_failed=")); g_out->println(p); }
+}
+
+// `status` is the unauthenticated pre-handshake query: the daemon needs to know
+// the pairing state before deciding whether to use the framed (v2) or plain
+// (v1) wire protocol. Always-allowed even on a paired Nano (see process_line).
+void handleStatus() {
+  uint64_t ctr = r503::ee_load_counter();
+  char ctr_buf[21];
+  r503::format_u64(ctr, ctr_buf);
+  g_out->print(F("OK paired="));
+  g_out->print(r503::ee_is_paired() ? F("true") : F("false"));
+  g_out->print(F(" counter="));
+  g_out->print(ctr_buf);
+  g_out->print(F(" fmt="));
+  g_out->print(r503::EE_FORMAT_VERSION);
+  g_out->println(F(" fw=1.0"));
+}
+
+// Milestone D pairing commands. `pair` is the daemon-driven pairing path
+// (refuses when already paired to defeat attacker-races-to-pair). `unpair`
+// is now the framed/no-arg form (handleUnpairFramed below) — the MAC proves
+// key knowledge so the key never crosses the wire.
+void handlePair(const String& args) {
+  if (r503::ee_is_paired()) { g_out->println(F("ERR already_paired")); return; }
+  if (args.length() != 32)  { g_out->println(F("ERR bad_args bad_key_len")); return; }
+  uint8_t key[16];
+  size_t key_len;
+  if (!r503::hex_to_bytes(args.c_str(), 32, key, 16, &key_len) || key_len != 16) {
+    g_out->println(F("ERR bad_args bad_key_hex")); return;
+  }
+  r503::ee_save_pairing(key);
+  g_out->println(F("OK paired"));
+}
+
+// Framed v2 unpair: no key argument. The MAC on the wrapping frame already
+// proves the caller knows the current key, so we just wipe EEPROM. Reached
+// only when process_line() has verified the frame and dispatched the inner
+// line "unpair" to dispatch().
+void handleUnpairFramed() {
+  if (!r503::ee_is_paired()) { g_out->println(F("ERR not_paired")); return; }
+  r503::ee_wipe();
+  g_out->println(F("OK unpaired"));
+}
+
+// process_line() is the top-level dispatcher post-Milestone-E. It enforces
+// SPEC §13.3/§13.4 (MAC framing + counter monotonicity) when the Nano is
+// paired, and falls through to the plain v1 dispatcher when unpaired.
+//
+// Always-unframed allowlist (works in either state):
+//   ping     — daemon's sync handshake
+//   status   — pairing-state probe; daemon needs it BEFORE choosing framed vs raw
+//
+// Unpaired Nano: every other command is dispatched raw (v1 mode), so the
+//   `pair` and `ee_*` test commands keep working during onboarding / recovery.
+//
+// Paired Nano: every other command MUST arrive framed as `C <ctr> <body> M <mac>`.
+//   process_line() decodes + verifies MAC + checks counter, then dispatches
+//   `<body>` with g_out swung to g_framer so the handler's print*() output is
+//   re-emitted as `R <ctr> <seq> <body> M <mac>` lines.
+void process_line(const String& line) {
+  bool paired = r503::ee_is_paired();
+
+  // Always-unframed shortcuts.
+  if (line == "ping") {
+    Serial.println(F("OK pong"));
+    return;
+  }
+  if (line == "status") {
+    g_out = &Serial;
+    dispatch(line);
+    return;
+  }
+
+  if (!paired) {
+    // v1 / pre-pair mode — everything goes raw.
+    g_out = &Serial;
+    dispatch(line);
+    return;
+  }
+
+  // Paired: require framing.
+  if (line.length() < 2 || line.charAt(0) != 'C' || line.charAt(1) != ' ') {
+    Serial.println(F("ERR mac_required"));
+    return;
+  }
+  if (!r503::ee_load_key(g_session_key)) {
+    Serial.println(F("ERR no_key"));
+    return;
+  }
+  uint64_t ctr = 0;
+  const char* inner = nullptr;
+  size_t inner_len = 0;
+  r503::FrameParseStatus rc = r503::verify_command_frame(
+      g_session_key, line.c_str(), line.length(),
+      &ctr, &inner, &inner_len);
+  if (rc != r503::FRAME_OK) {
+    // Named errors so the daemon-side parser and human log readers don't
+    // have to memorize FrameParseStatus enum values.
+    Serial.print(F("ERR "));
+    switch (rc) {
+      case r503::FRAME_BAD_LEADER:   Serial.println(F("bad_frame_leader")); break;
+      case r503::FRAME_TOO_SHORT:    Serial.println(F("frame_too_short")); break;
+      case r503::FRAME_BAD_SUFFIX:   Serial.println(F("bad_frame_suffix")); break;
+      case r503::FRAME_BAD_MAC_HEX:  Serial.println(F("bad_mac_hex")); break;
+      case r503::FRAME_BAD_COUNTER:  Serial.println(F("bad_counter")); break;
+      case r503::FRAME_BAD_SEQ:      Serial.println(F("bad_seq")); break;
+      case r503::FRAME_MAC_MISMATCH: Serial.println(F("mac_invalid")); break;
+      default:                       Serial.println(F("frame_unknown")); break;
+    }
+    return;
+  }
+  uint64_t last = r503::ee_load_counter();
+  if (ctr <= last) {
+    Serial.println(F("ERR replay"));
+    return;
+  }
+  // Commit the new counter BEFORE handler runs so a crash-and-restart can't
+  // be tricked into accepting the same counter twice. The handler's output
+  // (success or failure) is irrelevant for replay protection — what matters
+  // is that we've seen this counter.
+  r503::ee_save_counter(ctr);
+
+  g_session_counter = ctr;
+  g_session_seq = 0;
+  g_framer.reset();
+  g_out = &g_framer;
+
+  // String constructor needs a NUL terminator; inner is a non-terminated slice.
+  // 96 bytes covers any v2 command body: longest realistic inner cmdline is
+  // ~30 chars ("verify 199"-class commands), so we have ~3x headroom.
+  char ibuf[96];
+  size_t cap = sizeof(ibuf) - 1;
+  size_t n = (inner_len < cap) ? inner_len : cap;
+  memcpy(ibuf, inner, n);
+  ibuf[n] = 0;
+  dispatch(String(ibuf));
+
+  // Safety belt: if the handler wrote a final line without '\n', emit it now.
+  // All current handlers end with println, so this is typically a no-op.
+  g_framer.flush_line();
+  g_out = &Serial;
 }
 
 void dispatch(const String& line) {
@@ -144,10 +349,13 @@ void dispatch(const String& line) {
   else if (line == "clear confirm") handleClear(true);
   else if (line.startsWith("enroll ")) handleEnroll(line.substring(7).toInt());
   else if (line.startsWith("delete ")) handleDelete(line.substring(7).toInt());
-  else if (line == "wake") { Serial.print(F("OK wake=")); Serial.println(digitalRead(PIN_WAKE) == LOW ? '1' : '0'); }
-  else if (line == "ping") Serial.println(F("OK pong"));
-  else if (line == "led off") { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); Serial.println(F("OK")); }
-  else { Serial.print(F("ERR unknown_command ")); Serial.println(line); }
+  else if (line == "status") handleStatus();
+  else if (line.startsWith("pair ")) handlePair(line.substring(5));
+  else if (line == "unpair")         handleUnpairFramed();
+  else if (line == "wake") { g_out->print(F("OK wake=")); g_out->println(digitalRead(PIN_WAKE) == LOW ? '1' : '0'); }
+  else if (line == "ping") g_out->println(F("OK pong"));
+  else if (line == "led off") { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->println(F("OK")); }
+  else { g_out->print(F("ERR unknown_command ")); g_out->println(line); }
 }
 
 void setup() {
@@ -156,7 +364,8 @@ void setup() {
   Serial.begin(PC_BAUD);
   while (!Serial) { ; }
   delay(500);
-  Serial.println(F("R503FP READY fw=0.3"));
+  Serial.print(F("R503FP READY fw=1.0 paired="));
+  Serial.println(r503::ee_is_paired() ? F("true") : F("false"));
   finger.begin(FP_BAUD);
   emitInfo();
 }
@@ -167,13 +376,16 @@ void loop() {
     if (c == '\n' || c == '\r') {
       if (inbuf.length() > 0) {
         digitalWrite(LED_BUILTIN, HIGH);
-        dispatch(inbuf);
+        process_line(inbuf);
         digitalWrite(LED_BUILTIN, LOW);
         inbuf = "";
       }
     } else {
       inbuf += c;
-      if (inbuf.length() > 64) { Serial.println(F("ERR bad_args overflow")); inbuf = ""; }
+      // v2 framed commands are ~80 chars max ("C <counter> <body> M <16-hex>").
+      // 128 leaves comfortable headroom and matches the static `out` cap in
+      // LineFramer::flush_line.
+      if (inbuf.length() > 128) { Serial.println(F("ERR bad_args overflow")); inbuf = ""; }
     }
   }
 }

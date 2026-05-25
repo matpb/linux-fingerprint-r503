@@ -1,0 +1,277 @@
+//! Pairing flows for the v2 authenticated channel (SPEC §13.5).
+//!
+//! Three CLI entry points (all run synchronously inside the tokio main):
+//!   `r503d --pair`    — generate a fresh 128-bit key, send to Nano, persist.
+//!                       Requires /etc/r503d/allow-pair as host-side opt-in.
+//!   `r503d --unpair`  — wipe the Nano's EEPROM and delete the host key.
+//!                       Authenticates by passing the current key as proof
+//!                       (transitional; Milestone E wraps this in MAC framing).
+//!   `r503d --status`  — print pairing state from both sides without mutating.
+//!
+//! Each flow opens the serial port directly (not via SensorActor) so the
+//! daemon must be stopped first: `systemctl stop r503d && r503d --pair`.
+
+#![allow(dead_code)]
+
+use std::io::{ErrorKind, Read, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Context, Result};
+use serialport::SerialPort;
+
+use crate::framing;
+use crate::keystore;
+use crate::sensor;
+use crate::state;
+
+const BAUD: u32 = 115_200;
+
+// ----- port handling -----
+
+struct Link {
+    port: Box<dyn SerialPort>,
+    rx: Vec<u8>,
+}
+
+impl Link {
+    fn open(path: &str) -> Result<Self> {
+        let port = serialport::new(path, BAUD)
+            .timeout(Duration::from_millis(200))
+            .open()
+            .with_context(|| format!("opening {}", path))?;
+        let mut link = Link { port, rx: Vec::new() };
+        // Retry ping until OK pong (covers both cold DTR-reset boot and warm
+        // re-open). Up to 8s total.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut last: Option<String> = None;
+        while Instant::now() < deadline {
+            link.rx.clear();
+            let _ = link.port.clear(serialport::ClearBuffer::Input);
+            link.port.write_all(b"ping\n")?;
+            link.port.flush()?;
+            let per_attempt = Instant::now() + Duration::from_millis(800);
+            loop {
+                let remaining = per_attempt.saturating_duration_since(Instant::now());
+                if remaining.is_zero() { break; }
+                match link.read_line(remaining)? {
+                    Some(line) if line == "OK pong" => return Ok(link),
+                    Some(line) => { last = Some(line); }
+                    None => break,
+                }
+            }
+        }
+        bail!("could not sync with firmware; last line seen: {:?}", last)
+    }
+
+    fn cmd(&mut self, cmd: &str, timeout: Duration) -> Result<String> {
+        self.rx.clear();
+        let _ = self.port.clear(serialport::ClearBuffer::Input);
+        self.port.write_all(cmd.as_bytes())?;
+        self.port.write_all(b"\n")?;
+        self.port.flush()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let line = self
+                .read_line(deadline.saturating_duration_since(Instant::now()))?
+                .with_context(|| format!("timeout reading reply to: {}", cmd))?;
+            if line.is_empty() || line.starts_with("PROGRESS ") {
+                continue;
+            }
+            return Ok(line);
+        }
+    }
+
+    fn read_line(&mut self, max_wait: Duration) -> Result<Option<String>> {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            if let Some(nl) = self.rx.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = self.rx.drain(..=nl).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') { line.pop(); }
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            if Instant::now() >= deadline { return Ok(None); }
+            self.port.set_timeout(Duration::from_millis(100)).ok();
+            let mut buf = [0u8; 256];
+            match self.port.read(&mut buf) {
+                Ok(0) => {}
+                Ok(n) => self.rx.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::TimedOut => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+// ----- status parsing -----
+
+#[derive(Debug, Clone)]
+pub struct FirmwareStatus {
+    pub paired:  bool,
+    pub counter: u64,
+    pub fmt:     u8,
+    pub fw:      String,
+}
+
+fn parse_status(line: &str) -> Result<FirmwareStatus> {
+    let body = line.strip_prefix("OK ")
+        .ok_or_else(|| anyhow::anyhow!("status reply missing OK: {:?}", line))?;
+    let mut paired = None;
+    let mut counter = None;
+    let mut fmt = None;
+    let mut fw = None;
+    for tok in body.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            match k {
+                "paired"  => paired  = Some(v == "true"),
+                "counter" => counter = v.parse().ok(),
+                "fmt"     => fmt     = v.parse().ok(),
+                "fw"      => fw      = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+    Ok(FirmwareStatus {
+        paired:  paired.ok_or_else(|| anyhow::anyhow!("status missing paired"))?,
+        counter: counter.ok_or_else(|| anyhow::anyhow!("status missing counter"))?,
+        fmt:     fmt.ok_or_else(|| anyhow::anyhow!("status missing fmt"))?,
+        fw:      fw.ok_or_else(|| anyhow::anyhow!("status missing fw"))?,
+    })
+}
+
+// ----- flows -----
+
+pub fn run_status(port_override: Option<&str>) -> Result<()> {
+    let port_path = match port_override {
+        Some(p) => p.to_string(),
+        None => sensor::find_port().context("locating R503 serial port")?,
+    };
+    let mut link = Link::open(&port_path)?;
+    let raw = link.cmd("status", Duration::from_secs(1))?;
+    let fw_status = parse_status(&raw)?;
+    let host_key_present = Path::new(keystore::KEY_PATH).exists();
+    let host_bak_present = Path::new(keystore::KEY_BAK_PATH).exists();
+    let allow_pair = keystore::allow_pair_present();
+
+    println!("port:             {}", port_path);
+    println!("firmware:         fw={} fmt={}", fw_status.fw, fw_status.fmt);
+    println!("firmware paired:  {}", fw_status.paired);
+    println!("firmware counter: {}", fw_status.counter);
+    println!("host key:         {}",
+        if host_key_present { keystore::KEY_PATH } else { "(missing)" });
+    println!("host key.bak:     {}",
+        if host_bak_present { keystore::KEY_BAK_PATH } else { "(missing)" });
+    println!("allow-pair:       {}",
+        if allow_pair { keystore::ALLOW_PAIR_PATH } else { "(absent)" });
+
+    // Surface the consistency-mismatch warnings the operator probably cares about.
+    match (fw_status.paired, host_key_present || host_bak_present) {
+        (true, false) => println!("\nWARNING: firmware paired but no host key. Re-pair or reflash-to-wipe."),
+        (false, true) => println!("\nWARNING: host key present but firmware unpaired. Stale key — `--unpair` cannot succeed; delete host files manually."),
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn run_pair(port_override: Option<&str>) -> Result<()> {
+    if !keystore::allow_pair_present() {
+        bail!(
+            "host opt-in missing: create {} to authorize pairing\n\
+             (this gate defeats the attacker-races-to-pair scenario; see SPEC §13.5)",
+            keystore::ALLOW_PAIR_PATH
+        );
+    }
+    let port_path = match port_override {
+        Some(p) => p.to_string(),
+        None => sensor::find_port().context("locating R503 serial port")?,
+    };
+    let mut link = Link::open(&port_path)?;
+    let pre = parse_status(&link.cmd("status", Duration::from_secs(1))?)?;
+    if pre.paired {
+        bail!("Nano already paired; run `--unpair` first or reflash-to-wipe");
+    }
+
+    let key = keystore::generate_key().context("generating 128-bit key from /dev/urandom")?;
+    let key_h = keystore::key_hex(&key);
+    let reply = link.cmd(&format!("pair {}", key_h), Duration::from_secs(2))?;
+    if reply != "OK paired" {
+        bail!("Nano refused pair: {:?}", reply);
+    }
+    // Re-query to confirm the firmware actually persisted.
+    let post = parse_status(&link.cmd("status", Duration::from_secs(1))?)?;
+    if !post.paired {
+        bail!("paired ok but status still reports paired=false — EEPROM not committed?");
+    }
+
+    keystore::save_key(&key).context("saving host key")?;
+    // Fresh state: client counter starts at 1 (Nano's last_seen is 0 post-pair).
+    state::save(&state::State::fresh()).context("initializing client counter state")?;
+    keystore::remove_allow_pair().context("removing allow-pair marker")?;
+
+    println!("paired: fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
+    println!("host key written to {} (mode 0600)", keystore::KEY_PATH);
+    println!("backup written to {} (mode 0400)", keystore::KEY_BAK_PATH);
+    println!("state initialized at {} (next_cmd_counter=1)", state::STATE_PATH);
+    println!("opt-in marker {} removed", keystore::ALLOW_PAIR_PATH);
+    Ok(())
+}
+
+pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
+    let key = keystore::load_key().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no host key at {} or {}; cannot authenticate unpair.\n\
+             For the lost-key case, use reflash-to-wipe (firmware/r503fp_wipe/, Milestone F).",
+            keystore::KEY_PATH, keystore::KEY_BAK_PATH
+        )
+    })?;
+    let port_path = match port_override {
+        Some(p) => p.to_string(),
+        None => sensor::find_port().context("locating R503 serial port")?,
+    };
+    let mut link = Link::open(&port_path)?;
+    let pre = parse_status(&link.cmd("status", Duration::from_secs(1))?)?;
+    if !pre.paired {
+        // Already unpaired. Tidy up host-side files and call it a success.
+        keystore::delete_key().ok();
+        println!("Nano already unpaired; cleared host key files.");
+        return Ok(());
+    }
+
+    // v2 cutover: unpair is now a framed command (the MAC proves we know the
+    // key; we no longer send the key over the wire). The pre-cutover plaintext
+    // `unpair <key>` form is rejected by post-fw=1.0 firmware as mac_required.
+    let st = state::load().context("loading client counter state")?
+        .unwrap_or_else(state::State::fresh);
+    let counter = st.next_cmd_counter;
+    // Persist counter+1 BEFORE send (SPEC §13.4): crash here ⇒ next start
+    // skips one counter slot, never replays.
+    state::save(&state::State { next_cmd_counter: counter + 1 })
+        .context("persisting client counter before unpair")?;
+
+    let frame = framing::encode_command(&key, counter, "unpair");
+    let raw_reply = link.cmd(&frame, Duration::from_secs(2))?;
+    if !raw_reply.starts_with("R ") {
+        bail!("Nano refused framed unpair (unframed reply): {:?}", raw_reply);
+    }
+    let (got_ctr, _got_seq, body) = framing::verify_response(&key, &raw_reply)
+        .map_err(|e| anyhow::anyhow!("response framing: {:?} (line: {:?})", e, raw_reply))?;
+    if got_ctr != counter {
+        bail!("unpair response counter mismatch: got {}, want {}", got_ctr, counter);
+    }
+    if body != "OK unpaired" {
+        bail!("Nano refused unpair: {:?}", body);
+    }
+
+    // Post-unpair: Nano is now unpaired, so status goes unframed.
+    let post = parse_status(&link.cmd("status", Duration::from_secs(1))?)?;
+    if post.paired {
+        bail!("unpair ok but status still reports paired=true — EEPROM not committed?");
+    }
+    keystore::delete_key().context("removing host key files")?;
+    state::delete().context("removing client counter state")?;
+
+    println!("unpaired. fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
+    println!("host key + state files removed.");
+    Ok(())
+}

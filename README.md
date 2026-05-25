@@ -5,6 +5,12 @@ under $15. Drop-in replacement for upstream `fprintd` — PAM, KDE Settings,
 GNOME Settings, `fprintd-verify`, `sudo` with finger, screen-unlock with
 finger all work.
 
+**As of `fw=1.0` / `r503d 1.0.0`** the Arduino↔host wire is authenticated:
+every command and response carries a SipHash-2-4 MAC keyed to a
+TOFU-paired secret in EEPROM. Replay and hot-swap attacks against the USB
+serial link are blocked. See [`SPEC.md` §13](SPEC.md) for the full design,
+including what the threat model *doesn't* cover.
+
 ![R503 sensor mounted in a hand-cut wooden enclosure, blue ring glowing](docs/images/hero.jpg)
 
 *wish I had a 3d printer…*
@@ -13,8 +19,8 @@ finger all work.
    ┌──────────┐   UART    ┌─────────────┐   USB-CDC   ┌──────────────────┐
    │  Grow    │  57600 8N1│  Arduino    │  /dev/r503  │  r503d daemon    │
    │  R503    │◀─────────▶│  (firmware) │◀──────────▶│  net.reactivated │
-   │  sensor  │  3.3V TTL │             │  ASCII      │  .Fprint on D-Bus│
-   └──────────┘           └─────────────┘  protocol   └──────────────────┘
+   │  sensor  │  3.3V TTL │             │  framed,    │  .Fprint on D-Bus│
+   └──────────┘           └─────────────┘  MAC'd      └──────────────────┘
                                                               │
                                                               ▼
                                                        PAM, KDE, GNOME,
@@ -72,12 +78,24 @@ Open `firmware/r503fp/r503fp.ino` in the Arduino IDE and upload. Or with
 `arduino-cli`:
 
 ```bash
+# Uno R3:
 arduino-cli compile --fqbn arduino:avr:uno firmware/r503fp/
 arduino-cli upload  --fqbn arduino:avr:uno --port /dev/ttyACM0 firmware/r503fp/
+
+# Nano (modern Optiboot, including most Elegoo / WAVGAT clones):
+arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328 firmware/r503fp/
+arduino-cli upload  --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/ttyUSB0 firmware/r503fp/
+
+# Nano with legacy 57600-baud bootloader (older clones):
+#   replace `cpu=atmega328` with `cpu=atmega328old`
 ```
 
 The firmware uses `Adafruit_Fingerprint`. The IDE will offer to install it
 on first compile.
+
+If `arduino-cli upload` fails with `not in sync: resp=0x7e`, your bootloader
+is the other variant — swap `atmega328` ↔ `atmega328old` and retry. Both
+work; the difference is just bootloader baud rate.
 
 ### 2. Build the daemon
 
@@ -106,7 +124,38 @@ That script:
 It's idempotent — re-run it after every `cargo build --release` to
 redeploy the new binary.
 
-### 4. Enroll & verify
+### 4. Pair the Nano with the daemon
+
+A freshly-flashed Nano is unpaired — the daemon would talk to it but the
+firmware would reject every framed command. One-time pairing:
+
+```bash
+sudo systemctl stop r503d
+sudo mkdir -p /etc/r503d
+sudo touch /etc/r503d/allow-pair          # opt-in (see SPEC §13.5)
+sudo r503d --pair                          # generates a random 128-bit key,
+                                           # writes to /var/lib/r503d/key
+sudo systemctl start r503d
+```
+
+The opt-in file (`/etc/r503d/allow-pair`) exists to defeat an attacker
+racing to your desk with their own Nano — pairing without root is
+impossible. The file is auto-deleted by `r503d --pair` on success.
+
+Check the pairing state anytime:
+
+```bash
+sudo r503d --status
+# port:             /dev/r503
+# firmware:         fw=1.0 fmt=2
+# firmware paired:  true
+# firmware counter: 42
+# host key:         /var/lib/r503d/key
+# host key.bak:     /var/lib/r503d/key.bak
+# allow-pair:       (absent)
+```
+
+### 5. Enroll & verify
 
 ```bash
 # Enroll a finger (use KDE Settings → Users → Fingerprint Auth for a GUI):
@@ -122,14 +171,49 @@ sudo whoami
 Both KDE Settings (Plasma 6) and GNOME Control Center's user-account
 fingerprint dialogs drive `r503d` exactly as they drive upstream `fprintd`.
 
+### Re-pair / key rotation
+
+If you want a fresh key (key compromised, planned hardware swap, paranoia):
+
+```bash
+sudo systemctl stop r503d
+sudo r503d --unpair                        # framed; wipes Nano EEPROM + host key
+sudo touch /etc/r503d/allow-pair
+sudo r503d --pair                          # fresh random key
+sudo systemctl start r503d
+```
+
+### Recovery: lost the host key entirely
+
+The authenticated `--unpair` needs the key to authorize. If
+`/var/lib/r503d/key` AND `/var/lib/r503d/key.bak` are both gone (disk
+crash, accidental rm, etc.), you need the **reflash-to-wipe** escape
+hatch:
+
+```bash
+sudo systemctl stop r503d
+arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp_wipe/
+# Wait ~1s for the wipe to complete (LED starts blinking — that's the wipe sketch).
+arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp/
+sudo touch /etc/r503d/allow-pair
+sudo r503d --pair
+sudo systemctl start r503d
+```
+
+This isn't a backdoor an attacker can use: re-pairing requires root on
+the host (the opt-in file and the `--pair` CLI both need root), so a
+reflashed Nano can't be brought into trust without you already being
+root.
+
 ### Uninstall
 
 ```bash
 sudo bash pcside/daemon/dist/uninstall.sh
 ```
 
-Reverts everything, unmasks `fprintd`, leaves `/var/lib/r503d/users.json`
-in place in case you want to reinstall later.
+Reverts everything, unmasks `fprintd`, leaves `/var/lib/r503d/` (key,
+state, users) in place in case you want to reinstall later. Delete that
+directory manually if you want a true clean slate.
 
 ## How it works
 
@@ -137,7 +221,16 @@ The Arduino runs a small ASCII-protocol firmware (`firmware/r503fp/`)
 that talks the R503's native R30x ("Sync Word") binary protocol on its
 UART side and exchanges line-oriented text commands with the host over
 USB-CDC: `ping`, `info`, `enroll N`, `verify`, `delete N`, `clear`,
-`led off`. Full protocol in [`SPEC.md` §5](SPEC.md).
+`led off`. Full v1 protocol in [`SPEC.md` §5](SPEC.md).
+
+Since `fw=1.0` (Milestone E of the v2 authenticated-channel work), every
+command and response is wrapped in a `C <counter> <body> M <mac>` /
+`R <counter> <seq> <body> M <mac>` frame, MAC'd with SipHash-2-4 over a
+TOFU-paired 128-bit key. The Nano keeps a wear-leveled monotonic counter
+in EEPROM; the daemon keeps a matching counter in `/var/lib/r503d/state.json`.
+Replay attempts (firmware-side `incoming <= last_seen`) get rejected as
+`ERR replay`; tampered frames get `ERR mac_invalid`. Full spec, threat
+model, and known limitations in [`SPEC.md` §13](SPEC.md).
 
 The Rust daemon (`r503d`) speaks D-Bus on `net.reactivated.Fprint` — bit-for-bit
 the same interface upstream `fprintd` exposes — so every `fprintd` client
@@ -147,12 +240,42 @@ works unmodified. A JSON sidecar at `/var/lib/r503d/users.json` maps
 Layout:
 
 ```
-firmware/r503fp/r503fp.ino   Arduino firmware (ASCII protocol over USB-CDC)
+firmware/r503fp/             Arduino firmware (v2 framed ASCII protocol)
+firmware/r503fp_wipe/        Emergency one-shot EEPROM wipe (lost-key recovery)
+firmware/*                   Diagnostic / development sketches (ping, loopback, ...)
 pcside/daemon/               Rust daemon (the fprintd replacement)
+pcside/daemon/src/{crypto,framing,keystore,state,pairing}.rs
+                             v2 wire protocol implementation
 pcside/daemon/dist/          udev rule, systemd unit, install scripts
 docs/                        Decision logs + troubleshooting
-SPEC.md                      Full architecture + protocol spec
+SPEC.md                      Full architecture + protocol spec (§13 = v2 auth)
 ```
+
+## Security model — quick summary
+
+This is a hobby project. The wire-level authentication is designed against
+a specific threat — **"evil maid with five minutes and a spare Nano"** —
+not against nation-states or hardware attackers with labs.
+
+**Defended:**
+- Hot-swap of the Nano with a hostile unit (no key → all frames fail MAC).
+- Local process injecting fake match responses on `/dev/r503` (same).
+- Replay of recorded `OK match=...` frames in a future session.
+- Bit-flip tampering of any frame field (constant-time MAC compare).
+
+**Not defended:**
+- Host root compromise (key is in `/var/lib/r503d/key`, `0600 root:root`).
+- Physical attack on the Nano (EEPROM readback ~30 sec with ISP; chip decap; etc.).
+- Firmware-reflash attack (the Arduino bootloader has no signing — but
+  re-pairing requires root on the host, so a reflashed Nano can't be
+  brought into trust without host compromise anyway).
+- R503-side compromise (R30x protocol has no auth at all; out of our scope).
+- **No formal cryptographic review.** The primitives are standard, the
+  constructions are conventional, the implementations are short and
+  cross-verified against published vectors — but no professional has
+  audited the design. PRs welcome.
+
+Full threat model with rationale: [`SPEC.md` §13.1](SPEC.md).
 
 ## Limitations
 
@@ -165,6 +288,12 @@ SPEC.md                      Full architecture + protocol spec
   drives off `EnrollStatus` / `VerifyStatus` signals (which are emitted),
   not those polled hints — but a strict client that does
   `Get + PropertiesChanged` will see stale values.
+- **Single Nano = single point of failure.** If the Nano dies, fingerprint
+  login is gone until you reflash a spare and re-pair. Keep a password
+  auth method enabled as backup.
+- **No `r503d --resync` yet.** If `state.json` is lost while the firmware
+  still has a high `last_seen`, the daemon will hit `ERR replay` on first
+  send and need a manual reflash-to-wipe + re-pair. See [`SPEC.md` §13.11](SPEC.md).
 
 ## Troubleshooting
 
