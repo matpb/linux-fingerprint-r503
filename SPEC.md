@@ -344,137 +344,262 @@ The R503 has 200 slots. The PC-side driver needs to maintain a `slot → usernam
 
 ## 13. Authenticated Wire Protocol (v2)
 
-v1 ships with a plaintext ASCII protocol over USB-CDC. This section specifies the v2 upgrade that authenticates every frame in both directions with a shared key, blocks replay, and survives hardware swap. Forward-only; no compatibility window with v1 (rationale in §13.8).
+**Status: implemented in `fw=1.0` / `r503d 1.0.0`.** Replaces the v1 plaintext ASCII protocol with shared-key authentication over the same USB-CDC line. All commands and responses are MAC-tagged with SipHash-2-4; replay is blocked by monotonic counters on both ends. Forward-only — no compatibility window with v1 (rationale in §13.8).
+
+> ⚠️ **No formal cryptographic review.** This is a hobby project. The primitives (SipHash-2-4) are standard and the constructions are conventional, but no professional has audited the design or the implementation. The threat model (§13.1) is intentionally modest. If your threat model is bigger than "evil maid with a spare Nano," use something else.
 
 ### 13.1 Threat model
 
-**Defends against:**
-- **Hot-swap / evil maid** — attacker physically unplugs the real Nano and plugs in a hostile unit that always returns `OK match=...`. The replacement does not know the host key; its frames fail MAC verify.
-- **In-process MITM on `/dev/r503`** — any local user who somehow opens the serial device (mis-set ACL, supplementary group leak, kernel bug) cannot inject forged match responses. ACL on the device node becomes defense in depth, not the only layer.
-- **Replay** — a captured `OK match=0` frame from a legitimate verify cannot be replayed in a future session. Monotonic counters enforced on both ends.
+**What we defend against:**
 
-**Does NOT defend against:**
-- A host compromised at root: attacker reads the key from `/var/lib/r503d/key`, MAC is moot.
-- Side-channel attacks against the R503 sensor itself, including template extraction over the R30x UART. The sensor speaks R30x with no auth; that is out of scope, and Adafruit_Fingerprint exposes the same surface to anyone with bench access.
-- Physical attack on the Nano with kit (logic analyzer on the I/O bus, EEPROM readback via ISP, decap). With time and money, the key comes out.
-- Compromise of fprintd, PAM, the kernel, or anything downstream of r503d.
+| Attack | Defense |
+|---|---|
+| Hot-swap / evil maid: attacker unplugs the real Nano and inserts a hostile unit programmed to always return `OK match=...` | The hostile unit doesn't know the host key; every frame fails MAC verify and is rejected as `framing_rejected` by the daemon (which surfaces as `sensor_unreachable` to fprintd) |
+| In-process MITM on `/dev/r503`: any local user who can open the serial device (mis-set ACL, supplementary group leak, kernel bug) tries to inject `OK match=0` | Same — no key, no valid MAC |
+| Replay of captured response frames: attacker records a real `OK match=0` and tries to feed it back during a later verify | Response MAC is keyed on both the command counter and a per-response sequence number. A frame for command #42 is rejected during command #43 (counter mismatch); a frame for `seq=1` is rejected when `seq=0` is expected (seq mismatch) |
+| Replay of captured command frames: attacker records `C 42 verify 0 M ...` and tries to resend it | Firmware rejects with `ERR replay` whenever `incoming_counter <= last_seen`; `last_seen` is persisted in EEPROM and survives reboot |
+| Tampering with any frame field (counter, body, seq, MAC) | SipHash-2-4 is computed over a domain-separated input string covering all fields; bit-flips anywhere cause MAC verify to fail. Comparison is constant-time (XOR-OR loop) so timing channels don't leak which byte differed |
 
-We are targeting "attacker with five minutes and a spare Nano", not nation-state.
+**What we explicitly do NOT defend against:**
 
-### 13.2 Crypto primitive
+- **Host root compromise.** Attacker reads the key from `/var/lib/r503d/key` (`0600 root:root`) and forges any frame. If they have root, biometrics are moot anyway — they can disable PAM, dump process memory, or just edit `/etc/passwd`.
+- **Sensor-side compromise.** The R503 speaks the public R30x "Sync Word" protocol over UART with no authentication. Anyone with bench access to the R503's TX/RX wires can extract templates, replay match signals, or impersonate the sensor end-to-end. This is a property of the R30x chip family, not something we can fix in firmware.
+- **Confidentiality.** Frames are not encrypted, only authenticated. We don't encrypt because no secrets cross the wire — templates never leave the R503, and the only response payloads are `match=N confidence=M` or short error strings. An attacker recording the link learns which slot matched, not the template.
+- **Physical attack on the Nano.** EEPROM readback via ISP (~30 seconds with a $20 programmer), decap + microprobe (~$10k and a lab), or simple chip replacement reveals the key. The ATmega328P has no tamper resistance, no secure boot, no signed flash. Mitigation: tamper-evident sticker on the case so you notice the box was opened. Not implemented in this project.
+- **Firmware reflash via the Arduino bootloader.** Anyone with USB access and `arduino-cli` can flash arbitrary firmware. The bootloader has no signing. A malicious firmware could exfiltrate the key on first boot. But: re-pairing requires `/etc/r503d/allow-pair` (root-owned) or `r503d --pair` (root-only CLI), so a reflashed Nano can't be brought into the daemon's trust without root on the host — which is already game over per the first bullet.
+- **Side-channel attacks on the SipHash implementation itself.** Power analysis, EM emanations, and other physical side channels can recover the key from a running Nano in a controlled lab setting. Same physical-access caveat as above.
+- **Downstream compromise.** fprintd, PAM, the kernel, the system bus — anything below `r503d` in the trust chain is assumed trusted. If those are compromised, the authenticated channel still works correctly but the answer it returns gets ignored.
 
-**SipHash-2-4** with a 128-bit shared key, producing a 64-bit MAC.
+We're targeting **"evil maid with five minutes, a spare Nano, and a USB cable"** — not nation-state, not hardware lab.
 
-- ~500 bytes of AVR flash, ~30 µs per MAC for typical frame sizes on a 16 MHz ATmega328P.
+### 13.2 Cryptographic choices
+
+**Primitive: SipHash-2-4** (Aumasson & Bernstein, 2012).
+
+- 128-bit key, 64-bit MAC output.
+- ~80 LOC C++ on AVR, ~150 LOC Rust on the daemon (both hand-rolled to keep the audit surface small — cross-verified against the canonical reference vectors and against each other on 31 random inputs).
+- ~500 bytes of AVR flash, microseconds per MAC for our frame sizes.
 - Designed for short-message authentication on constrained devices. Not a hash — a keyed PRF.
-- 64-bit MAC is sized for an interactive protocol with bounded throughput (~1 command/sec). Online forgery requires ~2⁶³ attempts on average; at line rate that exceeds the heat death of the sun.
 
-Rejected:
-- **HMAC-SHA256** — 3-4 KB flash and ~1.5 ms per MAC on AVR. Overkill for the threat model and a tight fit alongside Adafruit_Fingerprint + SoftwareSerial in the existing firmware footprint.
-- **Ascon-Mac** (NIST LWC winner) — ~800 bytes flash, also fine. SipHash chosen for the longer deployment history, simpler audit, and slightly smaller code budget.
+**Key size: 128 bits.** Matches the SipHash spec exactly. Generated by `getrandom(2)` on the host (the kernel CSPRNG; on Linux this draws from `/dev/urandom`, seeded from hardware entropy).
+
+**MAC size: 64 bits.** SipHash-2-4's native output. Online forgery requires ~2⁶³ attempts on average; even at line rate (115200 baud ÷ ~80-byte frames ÷ Nano processing latency ≈ a few hundred commands/sec ceiling) that's longer than the universe has existed. Offline attacks need the key, which lives in EEPROM and `/var/lib/r503d/key`.
+
+**Constant-time MAC comparison.** Both firmware (`framing.h::verify_command_frame`) and daemon (`framing.rs::verify_command`/`verify_response`) compare expected and claimed MACs by XOR-OR over all bytes, never branching mid-loop on a per-byte difference. No early exit. No timing channel leaks which byte mismatched.
+
+**Domain separation in MAC inputs.** Commands and responses use distinct prefixes so a recorded response frame can't be replayed as a command (or vice versa) even if the visible payload happens to collide:
+
+- Command MAC input: `"CMD " || decimal(counter) || " " || cmd_line`
+- Response MAC input: `"RSP " || decimal(counter) || " " || decimal(seq) || " " || body_line`
+
+**Algorithms rejected and why:**
+
+- **HMAC-SHA256.** ~3-4 KB AVR flash, ~1.5 ms per MAC. Works but overkill given the threat model and tight against Adafruit_Fingerprint + SoftwareSerial in the existing firmware footprint. The bigger MAC (256 bits) buys nothing because the bottleneck is the host's per-second rate-limit, not MAC space.
+- **Ascon-Mac** (NIST LWC winner, 2023). ~800 bytes flash, also fine. SipHash chosen for the longer deployment history (~13 years in HashDoS-resistant hash tables, well battle-tested) and slightly smaller code budget. Honest assessment: Ascon would also be a reasonable choice.
+- **AEAD constructions** (Ascon-AEAD, ChaCha20-Poly1305). Provide confidentiality we don't need (§13.1). Would add nonce-management complexity without benefit.
 
 ### 13.3 Frame format
 
-Stays ASCII, line-oriented, screen-debuggable. Each frame gets a counter prefix and a hex MAC suffix.
+All wire frames are ASCII, line-oriented (terminated by `\n`), screen-debuggable. `screen /dev/r503 115200` lets you watch the protocol in real time.
 
 **Command (host → Nano):**
 ```
-C <cmd_counter> <command-line> M <mac_hex>
+C <cmd_counter> <command_line> M <mac_hex>
 ```
-- `cmd_counter` — monotonic 64-bit unsigned, decimal-encoded. Host bumps by 1 per command.
-- `command-line` — verbatim v1 command (e.g. `verify 0`).
-- `mac_hex` — 16 hex chars = 8 bytes = SipHash-2-4(key, `"CMD " || cmd_counter || " " || command-line`).
+- `cmd_counter` — monotonic 64-bit unsigned, decimal-encoded.
+- `command_line` — verbatim v1-style ASCII command (e.g. `verify 0`, `info`, `enroll 5`).
+- `mac_hex` — 16 hex chars = 8 bytes = `SipHash24(key, "CMD " || cmd_counter || " " || command_line)`, serialized little-endian.
 
-**Response (Nano → host)** — every line emitted in response, including `PROGRESS`:
+**Response (Nano → host)** — emitted by the firmware for every line a handler produces, including intermediate `PROGRESS` lines:
 ```
-R <cmd_counter> <resp_seq> <response-line> M <mac_hex>
+R <cmd_counter> <resp_seq> <body_line> M <mac_hex>
 ```
-- `cmd_counter` — echo of the originating command's counter. Binds this response to that specific command. Defeats replay of an old `OK` frame into a future session.
-- `resp_seq` — 0-based within the command's response stream. Bumps each line. The terminal `OK`/`ERR` ends the stream.
-- `mac_hex` — SipHash-2-4(key, `"RSP " || cmd_counter || " " || resp_seq || " " || response-line`).
+- `cmd_counter` — echo of the originating command's counter; binds the response to that specific command.
+- `resp_seq` — 0-based within the command's response stream. Increments per line. The terminal `OK ...` / `ERR ...` ends the stream.
+- `mac_hex` — `SipHash24(key, "RSP " || cmd_counter || " " || resp_seq || " " || body_line)`.
 
-**Examples on the wire (key omitted):**
+**Examples on the wire (key omitted, MACs faked):**
 ```
 C 42 verify 0 M 9f3a1c4d2b7e5601
 R 42 0 PROGRESS place_finger M 1a2b3c4d5e6f7081
 R 42 1 OK match=0 confidence=168 M deadbeef01020304
 ```
 
-**Unsolicited Nano emissions** (boot banner, async touch-wake notifications) use `cmd_counter=0` and an independent boot-counter as `resp_seq`. The daemon treats `cmd_counter=0` frames as advisory only — they cannot trigger PAM verdicts, only log events. A boot banner re-triggers session re-handshake (see §13.5).
+**Always-unframed allowlist.** Two commands work without framing in any pairing state, because the daemon needs them before the framed channel is usable:
+
+- `ping` → `OK pong`. Used by the daemon's sync handshake on serial open / reopen. Not security-relevant (no state mutation, no PAM verdict).
+- `status` → `OK paired=<bool> counter=<N> fmt=<V> fw=<X>`. Used by the daemon to discover whether the Nano is paired before deciding whether to frame subsequent commands. Read-only, no PAM impact.
+
+In addition, `pair <key_hex>` is accepted unframed but **only when the Nano is unpaired** (firmware enforces). This is the bootstrap step — there's no key to MAC with yet.
+
+Every other command requires framing on a paired Nano. Unframed traffic to a paired Nano (other than the three above) gets rejected with `ERR mac_required`.
+
+**Boot banner** is plain unframed text: `R503FP READY fw=1.0 paired=<true|false>`. Followed (only if the R503 sensor is responsive) by the unframed `info` line. The daemon's open-time sync handshake drains both before sending its first framed command. The banner is intentionally unframed — at boot the daemon hasn't loaded its key yet, and the banner is advisory anyway (paired state is also exposed authoritatively via `status`).
 
 ### 13.4 Counter rules
 
-- Host's `cmd_counter` is monotonic per pairing. Persisted to `/var/lib/r503d/state.json` after each command sent. Crash mid-command advances the counter on next boot — a small range may be "skipped" but the invariant holds.
-- Nano persists `last_seen_cmd_counter` in EEPROM. Each command is rejected unless `incoming > last_seen`. `last_seen` is updated only after successful MAC verify.
-- **EEPROM wear** — ATmega328P EEPROM rated 100k writes per cell. Store the counter as a 16-cell rotating log: 16 × 100k = 1.6M counter bumps ≈ 88 years at 50 logins/day. Implementation: 16-byte ring of `(8-byte counter, 1-byte CRC)` records, written round-robin, picked at boot by largest valid counter.
-- 64-bit counter wraps in geological time. Don't worry about it.
+**Host's `cmd_counter`** lives in `/var/lib/r503d/state.json` as `{"next_cmd_counter": N}`:
+
+- Persisted atomically via `tmp + fsync + rename`, mode `0600 root:root`.
+- Bumped BEFORE the command goes on the wire. This ordering is deliberate: a crash between bump and send means the host's next start uses a higher counter — the Nano sees a gap, accepts the higher value, and we lose one counter slot. A crash AFTER send is even safer (Nano already accepted, daemon's persisted value matches what was sent). The dangerous order — send first, then persist — is avoided because it would let a crash-and-restart reuse a counter (replay).
+
+**Nano's `last_seen_cmd_counter`** lives in EEPROM as a 16-cell wear-leveled ring:
+
+- Each cell: 8 bytes counter (little-endian) + 2 bytes CRC-16-CCITT over the counter bytes.
+- 10-byte cells × 16 = 160 bytes of EEPROM (offset 32..191 per `firmware/r503fp/eeprom.h`).
+- On boot, scan all cells; the largest valid-CRC cell is `last_seen`. Empty/blank cells (all `0xFF`) fail CRC check and are ignored.
+- On each accepted framed command, write the new counter to the NEXT cell in the ring (cyclic). Any single cell only takes 1/16 of the writes.
+- The Nano updates `last_seen` AFTER MAC verify + counter check pass, BEFORE the command handler runs. This guarantees that even a crash mid-handler doesn't let the same counter be re-accepted on next boot.
+
+**EEPROM endurance math.** ATmega328P EEPROM is rated 100,000 write cycles per cell. The ring distributes writes: 16 cells × 100,000 = 1,600,000 total command-counter advances before any single cell wears out. Per typical use:
+
+| Usage profile | Framed commands/day | Years until first cell exhaustion |
+|---|---:|---:|
+| Light (5 sudo/screen-unlock per day) | ~15 | ~290 |
+| Moderate (20/day) | ~60 | ~73 |
+| Heavy (50/day) | ~150 | ~29 |
+
+The 64-bit counter itself wraps in geological time; not a concern.
+
+**False-positive CRC matches.** Per-cell, the chance of bit-rot producing a spuriously valid CRC is 1/65,536 (CRC-16). With 16 cells the union bound puts the boot-time "wrong cell mistaken for valid" probability at ~1/4096 — only relevant if EEPROM cells actually decay (multi-decade timescales for ATmega328P at room temperature). Detected mismatches would manifest as a counter regression, blocked by `ERR replay`; the daemon would surface it and the user re-pairs.
 
 ### 13.5 Pairing (TOFU)
 
 **Initial pairing:**
 
-1. Nano EEPROM either contains a `PAIRED` magic word + key, or is blank.
-2. On boot, Nano emits a banner with `paired=true|false`.
-3. If `paired=false`, the daemon checks for explicit opt-in: presence of `/etc/r503d/allow-pair` **or** invocation as `r503d --pair`. Without opt-in, the daemon logs a warning and refuses to pair. This prevents an attacker who races to the desk with their own Nano from auto-pairing before Mat.
-4. Daemon generates a 128-bit key via `getrandom(2)`, sends the unauthenticated `pair <key_hex>` command. Nano accepts `pair` **only** when unpaired.
-5. Nano writes magic + key to EEPROM, replies `OK paired`, then reboots into the paired state.
-6. Daemon writes the key to `/var/lib/r503d/key` (mode `0600`, root:root) and removes `/etc/r503d/allow-pair`.
-7. Subsequent commands carry MACs.
+1. Nano EEPROM either contains the `R503FPv2` magic + format-version `0x02` + 16-byte key (paired state), or doesn't (unpaired). Boot banner advertises the state as `paired=<true|false>`.
+2. The daemon checks for explicit opt-in: either `/etc/r503d/allow-pair` exists, or the operator invoked `r503d --pair`. Without one of those, `r503d --pair` exits with a clear error pointing at the opt-in procedure. **This gate exists to defeat an attacker who races to your desk with their own Nano: they can't auto-pair because creating `/etc/r503d/allow-pair` requires root.**
+3. Daemon queries `status` (unframed) to confirm the Nano is unpaired. If already paired, refuses to over-write — re-pair requires explicit `--unpair` first or reflash-to-wipe.
+4. Daemon generates a 128-bit key via `getrandom(2)`, sends `pair <key_hex>` (unframed — no key yet to MAC with). The Nano accepts `pair` only when unpaired.
+5. Nano writes magic + format version + key + blank counter ring to EEPROM, responds `OK paired`.
+6. Daemon re-queries `status` to confirm persistence (defensive — should always succeed).
+7. Daemon writes the key to `/var/lib/r503d/key` (`0600 root:root`) and `/var/lib/r503d/key.bak` (`0400 root:root`), initializes `/var/lib/r503d/state.json` with `{"next_cmd_counter": 1}`, removes `/etc/r503d/allow-pair`.
+8. Subsequent commands carry MACs.
 
-**Re-pairing (key compromised, hardware swap, host rebuild):**
+**Re-pairing (key rotation, planned hardware swap, host rebuild):**
 
-- **Authenticated re-pair** — host issues an authenticated `unpair` command (MAC proves it knows the current key). Nano clears EEPROM, reboots into unpaired state. Initial pairing dance runs again with a fresh key. Primary path for the "host still has the key but wants to rotate it" case.
-- **Reflash-to-wipe** — escape hatch for "host lost the key entirely". Ship a separate `firmware/r503fp_wipe/` sketch that clears EEPROM on boot and halts. Flash it once with `arduino-cli` over the existing USB cable (no box opening, no hardware access), then flash the real firmware. Nano boots unpaired, normal TOFU pairing runs.
+- **Authenticated re-pair** — `r503d --unpair`. Loads the host key, sends a framed `unpair` command (the MAC proves we know the current key; the key itself is not transmitted). Nano clears EEPROM, responds `OK unpaired`. Daemon then deletes host key + state files. Primary path when the host still has the key.
 
-Re-pair without one of those paths is impossible. An evil-maid attacker with a fresh Nano cannot pair because they lack host-side opt-in (root-owned), and they cannot wipe an existing pairing without either the current key or physical USB access PLUS root on the host to re-pair. The reflash-to-wipe escape hatch itself is not an attack vector: even if an attacker reflashes the Nano via USB, they cannot re-pair without root on the host (`/etc/r503d/allow-pair` is root-owned, `r503d --pair` is a root-only CLI), and an attacker with host root has already won by other means.
+- **Reflash-to-wipe** — `firmware/r503fp_wipe/` is a one-shot sketch that clears EEPROM on boot and halts (LED blinks as a "not the real firmware" indicator). Use this when the host has lost the key entirely (key files deleted with no backup). Workflow:
+  ```
+  arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp_wipe/
+  # ... LED starts blinking, indicating wipe complete ...
+  arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp/
+  sudo touch /etc/r503d/allow-pair
+  sudo r503d --pair
+  ```
 
-### 13.6 Host-side key storage
+**Why reflash-to-wipe isn't itself an attack vector.** An attacker with physical USB access can reflash the Nano to anything — that's the Arduino bootloader's nature, with or without our wipe sketch. But re-pairing requires `/etc/r503d/allow-pair` (root-owned) or the `r503d --pair` CLI (root-only because it writes to `/var/lib/r503d/`). Without root on the host, a wiped Nano just stays unwiped from the daemon's perspective: the daemon's stored key still expects a paired sensor and all framed commands fail. The user notices, investigates, and remediates.
 
-- Path: `/var/lib/r503d/key`
-- Format: 32 hex chars + newline.
-- Permissions: `0600 root:root`.
-- Backup: written to `/var/lib/r503d/key.bak` (mode `0400`) at pairing time to survive accidental `rm` of the live file. Daemon falls through to `.bak` if the live file is missing.
-- Deliberately separate from `/etc/r503d/` so config can be world-readable without leaking the key.
+### 13.6 Host-side state
+
+```
+/etc/r503d/allow-pair          # opt-in marker (presence = consent to pair)
+/var/lib/r503d/key             # live key, 32 hex chars + newline, 0600 root:root
+/var/lib/r503d/key.bak         # fallback copy, 0400 root:root
+/var/lib/r503d/state.json      # {"next_cmd_counter": N}, 0600 root:root
+/var/lib/r503d/users.json      # user→slot map (pre-existing), 0600 root:root
+```
+
+- `/var/lib/r503d/` is created at first pair with mode `0700` (root-only directory).
+- The directory and config (`/etc/r503d/`) are deliberately separate so config can be world-readable without leaking the key.
+- Key write is atomic: `key.tmp` (0600) → `fsync` → `rename` to `key`, then `cp key key.bak` + `chmod 0400`. If the live file is later deleted by accident, the daemon falls through to `.bak`.
 
 ### 13.7 Failure modes
 
-| Failure | Detection | Recovery |
-|---|---|---|
-| MAC mismatch on incoming command | Nano replies `ERR mac_invalid` (unauthenticated error frame, no MAC) | Daemon logs, retries once; persistent failure surfaces as `sensor_unreachable` to fprintd |
-| Counter regression (replay) | Nano: `incoming <= last_seen` → `ERR replay` | Same as above |
-| MAC mismatch on incoming response | Daemon drops frame, logs, treats stream as `no_match` | Re-prompt user; persistent failure marks sensor unhealthy |
-| Host counter file lost (FS damage) | Daemon start: no state file | Refuse to operate; `r503d --resync` queries Nano via an authenticated `status` read, sets local counter to `last_seen + 1` |
-| Nano EEPROM corrupted (counter ring CRCs all fail) | Boot self-check fails | Banner: `degraded=true`; daemon refuses verifies; user runs physical re-pair |
-| Host loses key file (no backup) | Daemon start: clear error | Physical re-pair (D7 jumper) |
-| Nano-side `last_seen` ahead of host (host restored from backup) | First command: `ERR replay` | `r503d --resync` fast-forwards local counter |
+| Failure | Detection | Wire response | Recovery |
+|---|---|---|---|
+| MAC mismatch on incoming command | Firmware constant-time compare fails | `ERR mac_invalid` (unauthenticated; no MAC to bind to) | Daemon logs and surfaces `framing_rejected` to caller (pam_fprintd typically retries) |
+| Frame too short / bad suffix / bad leader / bad mac hex / bad counter token | Firmware `verify_command_frame` returns the corresponding status | `ERR frame_too_short` / `bad_frame_suffix` / `bad_frame_leader` / `bad_mac_hex` / `bad_counter` | Same |
+| Counter regression (replay) | Firmware: `incoming <= last_seen` | `ERR replay` | Same. If chronic (host's state.json got rolled back), wipe + re-pair |
+| Unframed command sent to paired Nano | Firmware: line doesn't start with `C ` and isn't `ping`/`status` | `ERR mac_required` | Daemon shouldn't have done this; indicates a bug or a v1 client talking to a paired Nano |
+| Pair command on already-paired Nano | Firmware: `ee_is_paired() == true` | `ERR already_paired` | `r503d --unpair` first, then re-pair |
+| Unpair command on unpaired Nano | Firmware: `ee_is_paired() == false` | `ERR not_paired` | Nothing — already in desired state |
+| Daemon-side MAC mismatch on response | Daemon's `verify_response` fails | Daemon errors the in-flight call; logged | Caller (pam_fprintd) typically retries once |
+| Daemon-side counter or seq mismatch | Daemon checks `R <ctr> <seq>` vs expected | Same | Same |
+| Host key file lost (no backup) | Daemon start: `keystore::load_key()` returns None on a paired Nano | Daemon proceeds in unframed mode, all commands fail with `mac_required` from firmware; PAM sees errors | Reflash-to-wipe + re-pair (§13.5) |
+| Host state.json lost | Daemon start: `state::load()` returns Ok(None) | Daemon defaults to `next_cmd_counter = 1`. On first send, firmware accepts if `1 > last_seen`; otherwise `ERR replay` | If replay-rejected, currently no automatic resync — wipe and re-pair. (`r503d --resync` is on the roadmap, §13.11.) |
+| Nano EEPROM ring all-CRC-fail (extreme bit-rot or fresh chip without prior pairing) | Firmware scan returns `any_valid=false` | `last_seen` reads as 0; daemon's counter > 0 will be accepted | Self-healing on first successful command |
+| R503 sensor doesn't respond on first `info` after boot | Firmware: `finger.verifyPassword()` returns false | Framed `ERR sensor_unreachable` | Daemon retries; usually transient (SoftwareSerial timing on cold boot) |
+
+**Errors the firmware emits for framing failures are intentionally unframed.** They have no agreed counter to bind a response MAC to. The daemon distinguishes them by the leading `R `: anything else is treated as a firmware-side rejection and surfaced as `SensorError::Command { code: "framing_rejected", detail }`.
 
 ### 13.8 Migration from v1 plaintext
 
-Hard cutover, no compatibility window. Reasons:
+**Hard cutover, no compatibility window.** A "downgrade to plaintext" capability would itself be an attack vector — strip it from the protocol entirely. v1 is a hobbyist prototype with one known deployment (the author's desk); no installed base to preserve.
 
-- A "downgrade to plaintext" capability is itself an attack vector — strip it from the protocol entirely.
-- v1 is a hobbyist prototype with one known deployment (Mat's desk). Preserving an installed base is not a real cost.
-- Firmware v2 and daemon v2 ship together. Mixed versions detect the mismatch on first banner (`fw=1.0` vs daemon's expected ≥ `1.0`) and refuse to operate with a clear error pointing at the upgrade procedure.
+**Versioning:** firmware `fw=0.4` → `fw=1.0`, daemon `r503d 0.1.0` → `1.0.0`. Mixed versions detect the mismatch at sensor open: the paired firmware rejects any unframed command other than `ping`/`status` with `ERR mac_required`, and the v1 daemon doesn't know how to frame, so the failure is loud and immediate.
 
-Firmware version bumps `fw=0.3` → `fw=1.0` to mark the protocol break. Daemon Cargo version bumps to `1.0.0` simultaneously.
+**EEPROM format version** also bumps: `fmt=1` (used briefly during Milestone C development with CRC-8) → `fmt=2` (CRC-16-CCITT cells). Any Nano with old-format EEPROM contents fails `ee_is_paired()` on the new firmware and is silently treated as unpaired — clean forced re-pair on first boot of `fw=1.0`.
 
-### 13.9 Code budget
+### 13.9 Implementation status
 
-- **Firmware**: ~350 LOC added. SipHash-2-4 impl ~120, framing wrapper ~80, EEPROM ring + pairing state machine ~150. No new external libraries — SipHash is small enough to inline.
-- **Daemon (Rust)**: ~400 LOC added. Framing wrapper ~100, pairing CLI subcommand ~150, state file IO ~80, error handling ~70. New crate deps: `siphasher` (or hand-rolled in 60 LOC for audit clarity), `rand_core` for the key. `serde_json` already pulled.
-- **Tests**: ~200 LOC daemon-side (property tests for frame round-trip + replay rejection + MAC tamper); ~50 LOC firmware-side via `pcside/r503ctl.py` with a `--key` mode.
+**Implemented:**
+- All of §13.2 (crypto), §13.3 (frame format), §13.4 (counter rules), §13.5 (pairing flow), §13.6 (host state), §13.7 (failure modes), §13.8 (migration).
+- Constant-time MAC comparison both sides.
+- Atomic state file writes.
+- Wear-leveled counter ring with CRC-16 integrity.
+- Reflash-to-wipe sketch (`firmware/r503fp_wipe/`).
+- `r503d --pair / --unpair / --status` CLI surface.
+- USB unplug/replug recovery: `SensorActor` reopens the port, re-applies auth (key + counter reloaded from state.json), continues. Tested implicitly during dev.
 
-### 13.10 Testing strategy
+**Implementation footprint (actual, not the original budget):**
 
-1. **Unit** — SipHash-2-4 reference vectors from the paper, both firmware and daemon.
-2. **Frame round-trip** — daemon-side property test: random key, random commands, encode/decode/verify.
-3. **Replay rejection** — daemon re-sends a known-good frame; firmware must reply `ERR replay`.
-4. **MAC tamper** — flip one bit each of MAC, counter, command body, `resp_seq`; each variant must yield `ERR mac_invalid`.
-5. **Pairing race** — without `/etc/r503d/allow-pair`, an unpaired Nano + fresh daemon must refuse to pair.
-6. **Full re-pair cycle** — unpair → pair, confirm new key is independent of old (compare `getrandom` output, confirm old key is rejected).
-7. **Counter persistence** — power-cycle Nano mid-session, confirm `last_seen` survives, confirm a replay of the last pre-cycle frame fails.
-8. **EEPROM wear simulation** — sacrificial Nano, scripted 100k+ cycles, confirm no single cell exceeds its rated limit (read-back validation against an external EEPROM dump).
-9. **End-to-end** — full PAM `sudo` flow on the authenticated channel; confirm round-trip latency overhead < 10 ms vs v1 baseline.
+| Component | Lines |
+|---|---:|
+| `firmware/r503fp/siphash.h` | ~80 |
+| `firmware/r503fp/framing.h` (including hex helpers + format_u64 + parse_u64 + MAC compute) | ~210 |
+| `firmware/r503fp/eeprom.h` (including CRC-16) | ~150 |
+| `firmware/r503fp/r503fp.ino` additions (LineFramer + process_line + handlers) | ~250 |
+| `firmware/r503fp_wipe/r503fp_wipe.ino` | ~40 |
+| **Firmware total added** | **~730** |
+| `pcside/daemon/src/crypto.rs` | ~150 incl. tests |
+| `pcside/daemon/src/framing.rs` | ~290 incl. tests |
+| `pcside/daemon/src/keystore.rs` | ~140 incl. tests |
+| `pcside/daemon/src/pairing.rs` | ~250 |
+| `pcside/daemon/src/state.rs` | ~85 incl. tests |
+| `sensor.rs` / `sensor_actor.rs` / `main.rs` deltas | ~150 |
+| **Daemon total added** | **~1,065** |
+
+**Footprint on the Nano (`fw=1.0`):** 69% of flash (21,290 / 30,720 bytes), 33% of SRAM (689 / 2,048 bytes) — measured with `arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328`.
+
+**Not implemented, on the roadmap (§13.11):**
+- `r503d --resync` for state.json loss recovery.
+- `degraded=true` banner field for EEPROM-ring-all-corrupted edge case.
+- Round-trip latency measurement (claimed budget was <10 ms vs v1 baseline; not actually benchmarked).
+
+### 13.10 Testing
+
+**Unit tests (run in CI via `cargo test`):**
+- SipHash-2-4 against published Aumasson vectors (lengths 0, 1, 8, 15) + determinism + key/message distinctness + block-boundary sensitivity — `crypto.rs` 10 tests.
+- Frame encode/decode round-trips, multi-space body, domain separation between command/response MACs, tampered body/counter/MAC rejection, malformed-frame rejection, wrong-leader rejection — `framing.rs` 12 tests.
+- Hex round-trip + parse rejection edges — `keystore.rs` 4 tests.
+- State JSON round-trip — `state.rs` 2 tests.
+
+**Cross-implementation tests** (require the Nano):
+- `pcside/daemon/examples/framing_xverify.rs` (pre-cutover) — 31 input cases: empty, sub-block, block-boundary, multi-block, randomized — firmware and daemon SipHash MACs match bit-for-bit. Also exercises bidirectional framing (daemon encodes → firmware parses → firmware encodes → daemon parses) with 4 tamper variants rejected.
+- `pcside/daemon/examples/tamper_test.rs` (post-cutover) — drives the firmware via the production framing module: valid frame → accepted, replay → `ERR replay`, MAC bit-flip → `ERR mac_invalid`, counter regression → `ERR replay`, valid recovery frame → accepted.
+
+**System / integration:**
+- EEPROM persistence + wear-leveling: 13 assertions including DTR-power-cycle survival and predicted cell distribution after 20 counter bumps — `eeprom_xverify.py`.
+- End-to-end pairing flow: 10 stages from prep → opt-in gate → pair → permissions check → re-pair → fprintd-verify regression — `pairing_e2e.sh`.
+- PAM `fprintd-verify mat` on the authenticated channel: 5/5 consecutive matches, counter advancing as expected.
+
+**Not yet done:**
+- Physical EEPROM wear-out simulation on a sacrificial Nano (mentioned in original spec; deferred — the per-cell write distribution is verified analytically and via 20-bump test).
+- Round-trip latency measurement under load.
+- Formal cryptographic review.
+- Fuzzing of the frame parser.
+
+### 13.11 Known limitations and future work
+
+- **Single Nano = single point of failure.** If the Nano dies, login via this path is gone until you reflash a spare. Keep a second authentication method enabled (password). The R503 templates live on the sensor itself, so if you transplant the R503 onto a fresh Nano you'd still need to enroll all fingers again unless you transferred the EEPROM somehow.
+- **No `r503d --resync`.** If `state.json` is lost while the firmware still has a high `last_seen`, the daemon will hit `ERR replay` on its first send and need a manual wipe-and-re-pair. The fix is a CLI subcommand that reads `last_seen` from a framed `status` (which already returns it) and sets the local counter to `last_seen + 1`. Easy; just not implemented.
+- **No `degraded=true` banner.** The EEPROM all-CRC-fail edge case currently silently degrades to `last_seen = 0`. Should expose this via the boot banner so the daemon can refuse to operate instead of accepting whatever the host sends.
+- **Hand-rolled SipHash, no third-party crypto audit.** The implementations are short and cross-verified against published vectors, but a professional audit would catch things this author wouldn't. PRs welcome from people who actually know what they're doing.
+- **No TPM-sealed key on the host.** The key file is plaintext on disk, protected only by filesystem ACLs. Sealing it to a TPM (via `systemd-cryptenroll` or `tpm2-tools`) would mean offline-disk attacks (stolen laptop, dd of unmounted partition) don't reveal the key. Reasonable v3 enhancement.
+- **No fuzzing of the firmware frame parser.** The parser is bounds-checked and the input is line-length capped at 128 chars (firmware-side `inbuf` overflow), but I'd feel better about it under a fuzzer.
+- **CH340-based Nano clones have a fixed USB VID/PID.** The daemon can't tell "the right Nano" from "any Nano" without looking at the udev-stable `/dev/r503` symlink (set up by the project's `70-r503.rules`). A genuine Nano (ATmega16U2 USB chip) or a Pro Micro (ATmega32U4 native USB) would allow a custom `iProduct` string for stronger identification. Not blocking.
 
 ---
 

@@ -8,3 +8,4 @@
 pub mod crypto;
 pub mod framing;
 pub mod keystore;
+pub mod state;

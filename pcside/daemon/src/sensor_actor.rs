@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, OnceCell};
 
 use crate::sensor::{MatchResult, R503, SensorError, SensorInfo};
+use crate::state;
 
 /// Progress channel for a single in-flight operation. The sensor actor writes
 /// each PROGRESS line; the caller (D-Bus interface) reads them and translates
@@ -68,6 +69,22 @@ enum HandleOutcome {
 ///
 /// Exposed pub(crate) so the D-Bus interface can map post-reopen-failure
 /// errors to `verify-disconnected` / `enroll-disconnected` status signals.
+/// Apply (or refresh) the v2 authenticated-channel state on a freshly-opened
+/// R503. Called after the initial open and after every reopen — a new R503
+/// instance has no key state, and `state.json` is the source of truth for the
+/// current counter (persisted on every framed send).
+fn apply_auth(s: &mut R503, key: Option<[u8; 16]>) {
+    if let Some(k) = key {
+        let next = state::load()
+            .ok()
+            .flatten()
+            .map(|st| st.next_cmd_counter)
+            .unwrap_or_else(|| state::State::fresh().next_cmd_counter);
+        tracing::info!(next_counter = next, "applying v2 auth to sensor");
+        s.set_auth(k, next);
+    }
+}
+
 pub(crate) fn is_fatal_io(err: &SensorError) -> bool {
     use std::io::ErrorKind::*;
     if let SensorError::Io(e) = err {
@@ -92,7 +109,10 @@ impl SensorActor {
     /// fully open and responsive. The worker thread survives subsequent USB
     /// unplug/replug cycles by lazily re-opening on the next request after an
     /// I/O failure.
-    pub async fn spawn(port: Option<String>) -> anyhow::Result<Self> {
+    pub async fn spawn(
+        port: Option<String>,
+        auth_key: Option<[u8; 16]>,
+    ) -> anyhow::Result<Self> {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<SensorRequest>();
         let (open_tx, open_rx) = oneshot::channel::<Result<(), SensorError>>();
 
@@ -101,7 +121,8 @@ impl SensorActor {
             .spawn(move || {
                 // Initial open — must succeed or the daemon won't start.
                 let mut sensor: Option<R503> = match R503::open(port.as_deref(), Duration::from_secs(8)) {
-                    Ok(s) => {
+                    Ok(mut s) => {
+                        apply_auth(&mut s, auth_key);
                         let _ = open_tx.send(Ok(()));
                         Some(s)
                     }
@@ -149,7 +170,13 @@ impl SensorActor {
                                     std::thread::sleep(Duration::from_millis(delay_ms));
                                 }
                                 match R503::open(port.as_deref(), REOPEN_SYNC_TIMEOUT) {
-                                    Ok(s) => {
+                                    Ok(mut s) => {
+                                        // Reapply auth on every reopen — the
+                                        // fresh R503 instance has no key state.
+                                        // Counter is reloaded from state.json
+                                        // since framed sends persist it after
+                                        // every command.
+                                        apply_auth(&mut s, auth_key);
                                         tracing::info!(
                                             port = s.port_path(),
                                             attempt,

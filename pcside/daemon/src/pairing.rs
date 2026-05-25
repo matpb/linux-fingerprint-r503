@@ -20,8 +20,10 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serialport::SerialPort;
 
+use crate::framing;
 use crate::keystore;
 use crate::sensor;
+use crate::state;
 
 const BAUD: u32 = 115_200;
 
@@ -203,11 +205,14 @@ pub fn run_pair(port_override: Option<&str>) -> Result<()> {
     }
 
     keystore::save_key(&key).context("saving host key")?;
+    // Fresh state: client counter starts at 1 (Nano's last_seen is 0 post-pair).
+    state::save(&state::State::fresh()).context("initializing client counter state")?;
     keystore::remove_allow_pair().context("removing allow-pair marker")?;
 
     println!("paired: fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
     println!("host key written to {} (mode 0600)", keystore::KEY_PATH);
     println!("backup written to {} (mode 0400)", keystore::KEY_BAK_PATH);
+    println!("state initialized at {} (next_cmd_counter=1)", state::STATE_PATH);
     println!("opt-in marker {} removed", keystore::ALLOW_PAIR_PATH);
     Ok(())
 }
@@ -233,18 +238,40 @@ pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    let key_h = keystore::key_hex(&key);
-    let reply = link.cmd(&format!("unpair {}", key_h), Duration::from_secs(2))?;
-    if reply != "OK unpaired" {
-        bail!("Nano refused unpair: {:?}", reply);
+    // v2 cutover: unpair is now a framed command (the MAC proves we know the
+    // key; we no longer send the key over the wire). The pre-cutover plaintext
+    // `unpair <key>` form is rejected by post-fw=1.0 firmware as mac_required.
+    let st = state::load().context("loading client counter state")?
+        .unwrap_or_else(state::State::fresh);
+    let counter = st.next_cmd_counter;
+    // Persist counter+1 BEFORE send (SPEC §13.4): crash here ⇒ next start
+    // skips one counter slot, never replays.
+    state::save(&state::State { next_cmd_counter: counter + 1 })
+        .context("persisting client counter before unpair")?;
+
+    let frame = framing::encode_command(&key, counter, "unpair");
+    let raw_reply = link.cmd(&frame, Duration::from_secs(2))?;
+    if !raw_reply.starts_with("R ") {
+        bail!("Nano refused framed unpair (unframed reply): {:?}", raw_reply);
     }
+    let (got_ctr, _got_seq, body) = framing::verify_response(&key, &raw_reply)
+        .map_err(|e| anyhow::anyhow!("response framing: {:?} (line: {:?})", e, raw_reply))?;
+    if got_ctr != counter {
+        bail!("unpair response counter mismatch: got {}, want {}", got_ctr, counter);
+    }
+    if body != "OK unpaired" {
+        bail!("Nano refused unpair: {:?}", body);
+    }
+
+    // Post-unpair: Nano is now unpaired, so status goes unframed.
     let post = parse_status(&link.cmd("status", Duration::from_secs(1))?)?;
     if post.paired {
         bail!("unpair ok but status still reports paired=true — EEPROM not committed?");
     }
     keystore::delete_key().context("removing host key files")?;
+    state::delete().context("removing client counter state")?;
 
     println!("unpaired. fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
-    println!("host key files removed.");
+    println!("host key + state files removed.");
     Ok(())
 }

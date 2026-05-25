@@ -11,6 +11,7 @@ mod keystore;
 mod pairing;
 mod sensor;
 mod sensor_actor;
+mod state;
 mod storage;
 
 use std::path::PathBuf;
@@ -111,8 +112,20 @@ async fn main() -> anyhow::Result<()> {
         "r503d starting"
     );
 
+    // Load host-side key (if paired). Mismatch (key without paired Nano, or
+    // vice versa) is surfaced after the sensor opens and we can compare states.
+    let auth_key = keystore::load_key();
+    if auth_key.is_some() {
+        tracing::info!(
+            key_path = keystore::KEY_PATH,
+            "v2 auth key loaded — sensor will use authenticated channel"
+        );
+    } else {
+        tracing::info!("no v2 auth key found — sensor will use plain v1 protocol");
+    }
+
     // Open the sensor first — fail fast if the Uno isn't plugged in.
-    let sensor = SensorActor::spawn(args.port.clone())
+    let sensor = SensorActor::spawn(args.port.clone(), auth_key)
         .await
         .context("opening R503 sensor")?;
 

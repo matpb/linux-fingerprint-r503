@@ -10,6 +10,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::framing;
+use crate::state;
+
 const DEFAULT_BAUD: u32 = 115_200;
 
 const TIMEOUT_INFO_MS: u64 = 2_000;
@@ -63,6 +66,15 @@ pub struct R503 {
     port_path: String,
     rx_buf: Vec<u8>,
     on_progress: ProgressFn,
+
+    // v2 authenticated-channel state (SPEC §13). When `key` is Some, every
+    // execute() wraps the outgoing command in `C <ctr> ... M <mac>` framing
+    // and verifies the corresponding `R <ctr> <seq> ... M <mac>` responses.
+    // When None, execute() falls back to the v1 plain-ASCII protocol.
+    key: Option<[u8; 16]>,
+    /// Counter to use on the NEXT framed command. Persisted to state::STATE_PATH
+    /// BEFORE each send so a crash never lets us reuse a counter.
+    client_counter: u64,
 }
 
 impl R503 {
@@ -87,9 +99,28 @@ impl R503 {
             port_path: path,
             rx_buf: Vec::with_capacity(1024),
             on_progress: Box::new(|msg: &str| tracing::debug!(progress = msg)),
+            key: None,
+            client_counter: 0,
         };
         this.sync(sync_timeout)?;
         Ok(this)
+    }
+
+    /// Engage the v2 authenticated channel. `next_counter` is the value to
+    /// use on the first framed command — typically loaded from `state.json`
+    /// (or `state::State::fresh().next_cmd_counter` for a brand-new pairing).
+    pub fn set_auth(&mut self, key: [u8; 16], next_counter: u64) {
+        self.key = Some(key);
+        self.client_counter = next_counter;
+    }
+
+    pub fn unset_auth(&mut self) {
+        self.key = None;
+        self.client_counter = 0;
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.key.is_some()
     }
 
     pub fn port_path(&self) -> &str {
@@ -232,16 +263,24 @@ impl R503 {
     }
 
     /// Send a command, stream PROGRESS lines through `on_progress`, return the
-    /// final OK/ERR line. Times out if neither arrives within `timeout_ms`.
+    /// final OK/ERR line body. Times out if neither arrives within `timeout_ms`.
     ///
-    /// Discards anything left in the input buffer first: a previous command
-    /// that hit Rust-side timeout may have left a late OK/ERR line in the
-    /// kernel queue or in `rx_buf`, and we don't want it to satisfy the next
-    /// command. (The firmware is single-threaded and won't reply out of order,
-    /// so dropping stale bytes is always safe.) A clear() failure means the
-    /// port is genuinely broken — surface it now rather than letting the
-    /// subsequent write+flush block on a dead fd.
+    /// Branches by auth state:
+    ///   - `key` is None → plain v1 ASCII protocol.
+    ///   - `key` is Some → v2 framed: wraps the outgoing command in
+    ///     `C <ctr> ... M <mac>` and verifies each `R <ctr> <seq> ... M <mac>`
+    ///     response against the same counter. PROGRESS bodies stream through
+    ///     `on_progress` after their frame's MAC + seq + counter check pass.
     fn execute(&mut self, cmd: &str, timeout_ms: u64) -> Result<String, SensorError> {
+        if self.key.is_some() {
+            self.execute_framed(cmd, timeout_ms)
+        } else {
+            self.execute_unframed(cmd, timeout_ms)
+        }
+    }
+
+    /// Plain v1 ASCII protocol — unchanged from pre-Milestone-E.
+    fn execute_unframed(&mut self, cmd: &str, timeout_ms: u64) -> Result<String, SensorError> {
         self.rx_buf.clear();
         self.port
             .clear(serialport::ClearBuffer::Input)
@@ -263,6 +302,81 @@ impl R503 {
                 return Ok(line);
             }
             (self.on_progress)(&format!("[unhandled] {}", line));
+        }
+    }
+
+    /// v2 framed protocol. `cmd` is the inner body (e.g. "verify 0"); we wrap
+    /// it with the current `client_counter`, persist counter+1 to disk BEFORE
+    /// sending (so a crash never lets us reuse a counter — SPEC §13.4), and
+    /// verify every incoming response frame against the same counter.
+    fn execute_framed(&mut self, cmd: &str, timeout_ms: u64) -> Result<String, SensorError> {
+        let key = self.key.expect("execute_framed called without key");
+        let counter = self.client_counter;
+
+        // Persist next BEFORE sending. Crash here ⇒ daemon restart sees the
+        // higher next, sends C=counter+1, Nano sees a gap, accepts. Crash
+        // after send but before next reply ⇒ Nano already updated last_seen
+        // to `counter`, daemon's next == counter+1 still works.
+        let next_state = state::State { next_cmd_counter: counter + 1 };
+        state::save(&next_state).map_err(|e| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("persist client_counter: {}", e),
+            ))
+        })?;
+        self.client_counter = counter + 1;
+
+        let frame = framing::encode_command(&key, counter, cmd);
+        self.rx_buf.clear();
+        self.port
+            .clear(serialport::ClearBuffer::Input)
+            .map_err(|e| SensorError::Io(e.into()))?;
+        self.port.write_all(frame.as_bytes())?;
+        self.port.write_all(b"\n")?;
+        self.port.flush()?;
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut expected_seq: u32 = 0;
+        loop {
+            let line = self
+                .read_line(deadline)?
+                .ok_or_else(|| SensorError::Timeout(cmd.to_string()))?;
+            if line.is_empty() {
+                continue;
+            }
+            // Firmware-side framing rejections come back unframed (the Nano
+            // has no agreed counter/seq for an invalid frame to bind to).
+            // Treat them as command errors so the daemon can surface them.
+            if !line.starts_with("R ") {
+                return Err(SensorError::Command {
+                    code: "framing_rejected".to_string(),
+                    detail: Some(line),
+                });
+            }
+            let (got_ctr, got_seq, body) = framing::verify_response(&key, &line).map_err(|e| {
+                SensorError::Protocol(format!("response framing: {:?} (line: {:?})", e, line))
+            })?;
+            if got_ctr != counter {
+                return Err(SensorError::Protocol(format!(
+                    "response counter mismatch: got {}, want {}",
+                    got_ctr, counter
+                )));
+            }
+            if got_seq != expected_seq {
+                return Err(SensorError::Protocol(format!(
+                    "response seq mismatch: got {}, want {}",
+                    got_seq, expected_seq
+                )));
+            }
+            expected_seq += 1;
+            if let Some(rest) = body.strip_prefix("PROGRESS ") {
+                (self.on_progress)(rest);
+                continue;
+            }
+            if body.starts_with("OK") || body.starts_with("ERR") {
+                return Ok(body.to_string());
+            }
+            (self.on_progress)(&format!("[unhandled] {}", body));
         }
     }
 

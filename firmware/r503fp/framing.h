@@ -106,7 +106,9 @@ inline bool parse_u32(const char* p, size_t len, uint32_t* out) {
 inline bool compute_cmd_mac(const uint8_t key[16], uint64_t counter,
                             const char* cmd_line, size_t cmd_line_len,
                             uint8_t mac_out[8]) {
-  char buf[192];
+  // 128 bytes covers any realistic command line. Commands are short:
+  // "CMD <20-digit-counter> <80-char-cmd>" ≈ 105 chars max.
+  char buf[128];
   size_t off = 0;
   if (off + 4 > sizeof(buf)) return false;
   memcpy(buf + off, "CMD ", 4);
@@ -126,7 +128,10 @@ inline bool compute_cmd_mac(const uint8_t key[16], uint64_t counter,
 inline bool compute_resp_mac(const uint8_t key[16], uint64_t counter, uint32_t seq,
                              const char* body, size_t body_len,
                              uint8_t mac_out[8]) {
-  char buf[192];
+  // 128 bytes covers any realistic response: longest body is the info line at
+  // ~80 chars, plus "RSP <20> <10> " ≈ 35 char overhead = ~115 chars.
+  char buf[128];
+
   size_t off = 0;
   if (off + 4 > sizeof(buf)) return false;
   memcpy(buf + off, "RSP ", 4);
