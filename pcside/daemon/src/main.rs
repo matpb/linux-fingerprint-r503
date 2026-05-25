@@ -3,8 +3,12 @@
 //! when `--session` is passed for dev). PAM, fprintd-{enroll,verify}, KDE and
 //! SDDM see this daemon as if it were upstream fprintd.
 
+mod crypto;
 mod dbus_iface;
 mod error;
+mod framing;
+mod keystore;
+mod pairing;
 mod sensor;
 mod sensor_actor;
 mod storage;
@@ -44,6 +48,19 @@ struct Args {
     /// Minimum match confidence to accept (R503 returns 0-1000-ish).
     #[arg(long, default_value_t = DEFAULT_CONFIDENCE_THRESHOLD)]
     confidence: u16,
+
+    /// One-shot: pair an unpaired Nano. Requires /etc/r503d/allow-pair (SPEC §13.5).
+    /// Stop the daemon first: `systemctl stop r503d && r503d --pair`.
+    #[arg(long, conflicts_with_all = ["unpair", "status"])]
+    pair: bool,
+
+    /// One-shot: wipe pairing from the Nano + host (key rotation / decommission).
+    #[arg(long, conflicts_with_all = ["pair", "status"])]
+    unpair: bool,
+
+    /// One-shot: print pairing state from both sides without mutating.
+    #[arg(long, conflicts_with_all = ["pair", "unpair"])]
+    status: bool,
 }
 
 fn default_storage_path(session: bool) -> PathBuf {
@@ -70,6 +87,17 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new("info,r503d=debug")),
         )
         .init();
+
+    // One-shot pairing flows exit before any daemon setup.
+    if args.status {
+        return pairing::run_status(args.port.as_deref());
+    }
+    if args.pair {
+        return pairing::run_pair(args.port.as_deref());
+    }
+    if args.unpair {
+        return pairing::run_unpair(args.port.as_deref());
+    }
 
     let storage_path = args
         .storage
