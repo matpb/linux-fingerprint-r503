@@ -28,7 +28,12 @@ use crate::storage::Storage;
 
 const BUS_NAME: &str = "net.reactivated.Fprint";
 
-const DEFAULT_CONFIDENCE_THRESHOLD: u16 = 50;
+// R503 returns 0..1000+. Adafruit's datasheet calls 100+ "secure"; Mat's
+// bench reading on his right-index has been 168/212/392/etc. — comfortably
+// above 80. Pre-fix this was 50, generous enough that a hammered-verify
+// attacker could brute a no-rate-limit verify loop with random finger
+// pressure. Bumped per audit §P1-7.
+const DEFAULT_CONFIDENCE_THRESHOLD: u16 = 80;
 
 #[derive(Parser, Debug)]
 #[command(name = "r503d", about = "R503 fprintd-replacement daemon")]

@@ -527,6 +527,17 @@ impl Device {
         tokio::spawn(async move {
             let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
+            // Retry budget (audit §P1-7 / §S4.2): the firmware-asks-retry
+            // branch used to spin forever, letting an attacker hammer verify
+            // with arbitrary finger pressure / coverage until they got a
+            // match. Bound to 5 retries OR 30s, whichever comes first. A
+            // real `no_match` from the firmware (the wrong-finger terminal
+            // status) is not affected — it already breaks the loop below.
+            const MAX_RETRIES: u32 = 5;
+            const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+            let started_at = std::time::Instant::now();
+            let mut retries: u32 = 0;
+
             let final_status: Option<&'static str> = 'outer: loop {
                 if state.lock().await.action != Some(my_token) {
                     tracing::info!("verify externally stopped");
@@ -563,7 +574,17 @@ impl Device {
                             || code_low.starts_with("capture_failed")
                             || code_low.starts_with("image2tz_failed")
                         {
-                            tracing::debug!("verify retry (firmware {} {:?})", code, detail);
+                            if retries >= MAX_RETRIES || started_at.elapsed() > RETRY_BUDGET {
+                                tracing::info!(
+                                    retries, elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                    "verify retry budget exhausted ({} {:?}); forcing no-match",
+                                    code, detail
+                                );
+                                break 'outer Some("verify-no-match");
+                            }
+                            retries += 1;
+                            tracing::debug!("verify retry {}/{} (firmware {} {:?})",
+                                retries, MAX_RETRIES, code, detail);
                             Device::verify_status(&owned_emitter, "verify-retry-scan", false)
                                 .await
                                 .ok();
@@ -575,7 +596,16 @@ impl Device {
                     }
                     Err(SensorError::Timeout(_)) => {
                         // Rust-side timeout (shouldn't normally fire — the firmware's
-                        // 10s capture timeout is < our 15s execute timeout).
+                        // 10s capture timeout is < our 15s execute timeout). Counted
+                        // against the same retry budget as firmware-retryables.
+                        if retries >= MAX_RETRIES || started_at.elapsed() > RETRY_BUDGET {
+                            tracing::info!(
+                                retries, elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                "verify retry budget exhausted (rust-side timeout); forcing no-match"
+                            );
+                            break 'outer Some("verify-no-match");
+                        }
+                        retries += 1;
                         Device::verify_status(&owned_emitter, "verify-retry-scan", false)
                             .await
                             .ok();
