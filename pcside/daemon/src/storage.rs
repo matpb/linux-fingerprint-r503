@@ -158,11 +158,38 @@ impl Storage {
     }
 
     async fn save(&self) -> Result<(), StorageError> {
-        let guard = self.inner.read().await;
-        let bytes = serde_json::to_vec_pretty(&guard.data)?;
-        let tmp = guard.path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &guard.path).await?;
+        // Snapshot what we need under the read lock, then drop it before
+        // jumping to the blocking thread: spawn_blocking + the file syscalls
+        // are not async-friendly.
+        let (bytes, path, tmp) = {
+            let guard = self.inner.read().await;
+            let bytes = serde_json::to_vec_pretty(&guard.data)?;
+            let path = guard.path.clone();
+            let tmp = guard.path.with_extension("json.tmp");
+            (bytes, path, tmp)
+        };
+        // Match keystore.rs / state.rs: open with 0o600, write, fsync the
+        // tmp file, then rename. Without the fsync, a power loss between
+        // the rename's metadata commit and the data block flush can leave
+        // an empty/garbled users.json on next boot — at which point every
+        // user looks unenrolled and the re-enroll attack surface re-opens
+        // (audit §P1-6).
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, &path)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("spawn_blocking: {}", e)))??;
         Ok(())
     }
 }
