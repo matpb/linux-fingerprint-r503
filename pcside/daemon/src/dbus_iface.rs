@@ -43,25 +43,6 @@ fn validate_finger(name: &str, allow_any: bool) -> Result<(), FprintError> {
     }
 }
 
-/// Resolve the calling client's username by asking the bus daemon for the
-/// sender's uid and looking up /etc/passwd. fprintd's empty-username convention
-/// means "use the caller's identity" — without this resolution, an empty
-/// string falls back to the daemon's own uid (root), which is never useful.
-async fn resolve_caller(
-    conn: &zbus::Connection,
-    sender: Option<&str>,
-) -> Result<String, FprintError> {
-    let sender = sender.ok_or_else(|| FprintError::Internal("missing sender".into()))?;
-    let bus_name = zbus::names::BusName::try_from(sender)
-        .map_err(|e| FprintError::Internal(format!("invalid sender {}: {}", sender, e)))?;
-    let dbus = zbus::fdo::DBusProxy::new(conn).await?;
-    let uid = dbus
-        .get_connection_unix_user(bus_name)
-        .await
-        .map_err(|e| FprintError::Internal(format!("GetConnectionUnixUser: {}", e)))?;
-    pwd_lookup(uid).ok_or_else(|| FprintError::Internal(format!("uid {} not in passwd", uid)))
-}
-
 /// Update the polled `finger-present` / `finger-needed` properties from a
 /// firmware PROGRESS line. Best-effort hint for GUI clients that poll those
 /// properties — we don't emit PropertiesChanged, so transient state is only
@@ -129,8 +110,9 @@ async fn delete_user_fingers(
 }
 
 /// Cheap getpwuid_r without pulling in the `nix` crate. Returns the username
-/// for the given uid, or None on failure.
-fn pwd_lookup(uid: u32) -> Option<String> {
+/// for the given uid, or None on failure. Crate-visible so `auth.rs` can
+/// resolve the caller without a second helper.
+pub(crate) fn pwd_lookup(uid: u32) -> Option<String> {
     use std::ffi::CStr;
     use std::mem::MaybeUninit;
     use std::ptr;
@@ -333,15 +315,13 @@ impl Device {
         #[zbus(connection)] conn: &zbus::Connection,
         username: String,
     ) -> Result<Vec<String>, FprintError> {
-        // Empty username = "the caller themselves". Resolve via
-        // org.freedesktop.DBus.GetConnectionUnixUser so we actually
-        // identify the caller, not the daemon (which runs as root).
-        let user = if username.is_empty() {
-            let sender = header.sender().map(|s| s.to_string());
-            resolve_caller(conn, sender.as_deref()).await?
-        } else {
-            username
-        };
+        // `auth::authorize_username` handles the fprintd empty-string
+        // convention, the self-request fast path, the uid-0 (PAM) fast path,
+        // and falls through to polkit for cross-user requests. Without this
+        // gate, any local user could enumerate any other user's fingers
+        // (see SECURITY_HARDENING_PLAN.md §P0-3).
+        let sender = header.sender().map(|s| s.to_string());
+        let user = crate::auth::authorize_username(conn, sender.as_deref(), &username).await?;
         let fingers = self.storage.list_fingers(&user).await;
         if fingers.is_empty() {
             return Err(FprintError::NoEnrolledPrints(format!(
@@ -358,12 +338,12 @@ impl Device {
         #[zbus(connection)] conn: &zbus::Connection,
         username: String,
     ) -> Result<(), FprintError> {
-        let user = if username.is_empty() {
-            let sender = header.sender().map(|s| s.to_string());
-            resolve_caller(conn, sender.as_deref()).await?
-        } else {
-            username
-        };
+        // Authorize before nuking anything. Pre-fix, any local user could
+        // wipe `root`'s enrollment without a claim (SECURITY_HARDENING_PLAN.md
+        // §P0-2). The `DeleteEnrolledFingers2` variant below is claim-gated,
+        // but this legacy entry point is still exposed for upstream parity.
+        let sender = header.sender().map(|s| s.to_string());
+        let user = crate::auth::authorize_username(conn, sender.as_deref(), &username).await?;
         delete_user_fingers(&self.sensor, &self.storage, &user).await
     }
 
@@ -414,11 +394,13 @@ impl Device {
         username: String,
     ) -> Result<(), FprintError> {
         let sender = header.sender().map(|s| s.to_string());
-        let user = if username.is_empty() {
-            resolve_caller(conn, sender.as_deref()).await?
-        } else {
-            username
-        };
+        // The claim is the gate that everything else hangs off — once it's
+        // uid-bound, `enroll_start` / `verify_start` / `delete_*2` inherit
+        // the binding for free via `ensure_claim`. Pre-fix, a local user
+        // could `Claim "root"` and then enroll their own finger under root's
+        // identity (SECURITY_HARDENING_PLAN.md §P0-1).
+        let user =
+            crate::auth::authorize_username(conn, sender.as_deref(), &username).await?;
         let mut state = self.state.lock().await;
         // Single-user pragma: if the device is already claimed for the SAME
         // user and no operation is in flight, allow the new caller to take

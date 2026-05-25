@@ -27,6 +27,11 @@ pub enum FprintError {
 
     /// Print deletion failed (sensor flash or storage layer rejected).
     PrintsNotDeleted(String),
+
+    /// Caller is not authorized to perform the requested action against the
+    /// requested user (cross-user op without polkit clearance, or polkit denied).
+    /// Maps to upstream fprintd's `net.reactivated.Fprint.Error.PermissionDenied`.
+    PermissionDenied(String),
 }
 
 impl From<zbus::Error> for FprintError {

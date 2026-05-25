@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<!--
+  PolicyKit action shipped by r503d. STRICTER than upstream fprintd: defaults
+  to `no` for every session class so cross-user fingerprint ops from non-root
+  callers are denied without ever prompting on the active session. An SSH
+  attacker calling `Claim "mat"` cannot trigger a polkit dialog that an
+  inattentive admin might click through (see SECURITY_HARDENING_PLAN.md §S1).
+
+  Only `setusername` is gated: cross-user enroll / verify / list / delete
+  goes through this action; same-user requests and uid-0 (PAM) callers skip
+  polkit entirely (see pcside/daemon/src/auth.rs).
+
+  Need to enroll for another user? Become root:
+      sudo fprintd-enroll target-user
+
+  Want kiosk / multi-user-lab behavior? Drop a polkit rule into
+  /etc/polkit-1/rules.d/ that grants specific subjects, e.g.:
+
+      polkit.addRule(function(action, subject) {
+          if (action.id == "net.reactivated.fprint.device.setusername" &&
+              subject.isInGroup("fprintadmin")) {
+              return polkit.Result.YES;
+          }
+      });
+-->
+<policyconfig>
+  <vendor>r503d (linux-fingerprint-r503)</vendor>
+  <vendor_url>https://github.com/matpb/linux-fingerprint-r503</vendor_url>
+
+  <action id="net.reactivated.fprint.device.setusername">
+    <description>Act on another user's fingerprint enrollment</description>
+    <message>Authentication is required to manage another user's fingerprints</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>no</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

@@ -3,6 +3,7 @@
 //! when `--session` is passed for dev). PAM, fprintd-{enroll,verify}, KDE and
 //! SDDM see this daemon as if it were upstream fprintd.
 
+mod auth;
 mod crypto;
 mod dbus_iface;
 mod error;
