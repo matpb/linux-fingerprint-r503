@@ -194,6 +194,15 @@ pub fn run_pair(port_override: Option<&str>) -> Result<()> {
 
     let key = keystore::generate_key().context("generating 128-bit key from /dev/urandom")?;
     let key_h = keystore::key_hex(&key);
+    // Close the allow-pair gate BEFORE sending the key (SPEC §13.5 / audit
+    // §P1-1). If the daemon crashes between the Nano accepting the key and
+    // the host persisting it, the next `--pair` attempt would otherwise be
+    // racetable by a hostile Nano replacement. With the gate closed first,
+    // any recovery path requires admin to recreate the opt-in marker
+    // explicitly. Cost: a legitimate failure mid-flow (USB hiccup, Nano
+    // refusal) requires `--unpair` + `touch /etc/r503d/allow-pair` to retry.
+    keystore::remove_allow_pair().context("closing allow-pair gate before sending key")?;
+
     let reply = link.cmd(&format!("pair {}", key_h), Duration::from_secs(2))?;
     if reply != "OK paired" {
         bail!("Nano refused pair: {:?}", reply);
@@ -207,13 +216,12 @@ pub fn run_pair(port_override: Option<&str>) -> Result<()> {
     keystore::save_key(&key).context("saving host key")?;
     // Fresh state: client counter starts at 1 (Nano's last_seen is 0 post-pair).
     state::save(&state::State::fresh()).context("initializing client counter state")?;
-    keystore::remove_allow_pair().context("removing allow-pair marker")?;
 
     println!("paired: fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
     println!("host key written to {} (mode 0600)", keystore::KEY_PATH);
     println!("backup written to {} (mode 0400)", keystore::KEY_BAK_PATH);
     println!("state initialized at {} (next_cmd_counter=1)", state::STATE_PATH);
-    println!("opt-in marker {} removed", keystore::ALLOW_PAIR_PATH);
+    println!("opt-in marker {} closed before key send", keystore::ALLOW_PAIR_PATH);
     Ok(())
 }
 
