@@ -215,8 +215,10 @@ inline FrameParseStatus verify_command_frame(
   if (!compute_cmd_mac(key, *counter, *cmd_line, *cmd_line_len, computed_mac)) {
     return FRAME_TOO_SHORT;
   }
-  // Constant-time compare not required (we just authenticated successfully or
-  // didn't), but still cheap to do.
+  // Constant-time compare: the loop body has no data-dependent branches,
+  // so a serial-MITM attacker who can measure per-byte firmware latency
+  // can't probe MAC bytes one position at a time. Mirrored on the host
+  // (pcside/daemon/src/framing.rs) via u64 XOR. Audit §P1-3 / §S5.
   uint8_t diff = 0;
   for (int i = 0; i < 8; ++i) diff |= claimed_mac[i] ^ computed_mac[i];
   if (diff != 0) return FRAME_MAC_MISMATCH;
