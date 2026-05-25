@@ -56,19 +56,30 @@ install -d -m 0755 /usr/local/share/dbus-1/system-services
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.Fprint.service" \
     /usr/local/share/dbus-1/system-services/net.reactivated.Fprint.service
 
-echo ">>> [6/9] installing polkit policy -> /usr/share/polkit-1/actions/"
+echo ">>> [6/10] installing polkit policy -> /usr/share/polkit-1/actions/"
 install -d -m 0755 /usr/share/polkit-1/actions
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.fprint.device.r503d.policy" \
     /usr/share/polkit-1/actions/net.reactivated.fprint.device.r503d.policy
 
-echo ">>> [7/9] systemctl daemon-reload"
+echo ">>> [7/10] installing D-Bus system bus policy -> /etc/dbus-1/system.d/"
+install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.Fprint.conf" \
+    /etc/dbus-1/system.d/net.reactivated.Fprint.conf
+# Tell the bus to reread its system policies. dbus-broker supports reload;
+# fall through to a full restart for old dbus-daemon hosts or if reload
+# isn't supported.
+systemctl reload dbus-broker.service 2>/dev/null \
+    || systemctl reload dbus.service 2>/dev/null \
+    || systemctl restart dbus-broker.service 2>/dev/null \
+    || systemctl restart dbus.service
+
+echo ">>> [8/10] systemctl daemon-reload"
 systemctl daemon-reload
 
-echo ">>> [8/9] stopping + masking fprintd.service"
+echo ">>> [9/10] stopping + masking fprintd.service"
 systemctl stop fprintd.service 2>/dev/null || true
 systemctl mask fprintd.service
 
-echo ">>> [9/9] enabling + starting r503d.service"
+echo ">>> [10/10] enabling + starting r503d.service"
 systemctl enable r503d.service
 systemctl restart r503d.service
 
