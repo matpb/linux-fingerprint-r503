@@ -21,8 +21,21 @@ use std::path::Path;
 pub const KEY_DIR: &str = "/var/lib/r503d";
 pub const KEY_PATH: &str = "/var/lib/r503d/key";
 pub const KEY_BAK_PATH: &str = "/var/lib/r503d/key.bak";
+/// TPM2-sealed copy of the host key (SPEC §13.12). Binary blob produced by
+/// `crate::tpm::seal_key`, unsealed at boot. When this exists the daemon
+/// MUST use it — falling through to plaintext would defeat the seal.
+pub const KEY_TPM_PATH: &str = "/var/lib/r503d/key.tpm";
 pub const ALLOW_PAIR_DIR: &str = "/etc/r503d";
 pub const ALLOW_PAIR_PATH: &str = "/etc/r503d/allow-pair";
+
+/// Where a key on disk came from. Surfaces in logs so the operator can tell
+/// at a glance whether the daemon is running in plaintext-key mode (the
+/// original v2 deployment) or TPM-sealed mode (SPEC §13.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Plaintext,
+    Tpm,
+}
 
 pub fn allow_pair_present() -> bool {
     Path::new(ALLOW_PAIR_PATH).exists()
@@ -46,6 +59,28 @@ pub fn load_key() -> Option<[u8; 16]> {
         }
     }
     None
+}
+
+/// Load the host key in TPM-aware order: sealed blob first, plaintext fallback
+/// ONLY when no sealed blob exists. When `KEY_TPM_PATH` is present, this
+/// function either returns the unsealed key or errors — it will not silently
+/// fall back to plaintext (which would defeat the seal). The caller is
+/// expected to surface the error and refuse to start.
+pub fn load_key_with_source() -> Result<Option<([u8; 16], KeySource)>> {
+    if Path::new(KEY_TPM_PATH).exists() {
+        let blob = fs::read(KEY_TPM_PATH)
+            .with_context(|| format!("reading sealed key blob at {}", KEY_TPM_PATH))?;
+        let key = crate::tpm::unseal_key(&blob).context(
+            "unsealing TPM-protected host key. \
+                 The Secure Boot policy (PCR7) changed since this key was sealed. \
+                 Recovery: `sudo dist/reseal-tpm.sh` (SPEC §13.12).",
+        )?;
+        return Ok(Some((key, KeySource::Tpm)));
+    }
+    if let Some(k) = load_key() {
+        return Ok(Some((k, KeySource::Plaintext)));
+    }
+    Ok(None)
 }
 
 /// Write the key atomically to `KEY_PATH` (mode 0600), then copy to
@@ -81,7 +116,7 @@ pub fn save_key(key: &[u8; 16]) -> Result<()> {
     Ok(())
 }
 
-/// Remove both key files. Idempotent — missing files are not an error.
+/// Remove both plaintext key files. Idempotent — missing files are not an error.
 pub fn delete_key() -> Result<()> {
     for p in [KEY_PATH, KEY_BAK_PATH] {
         match fs::remove_file(p) {
@@ -90,6 +125,52 @@ pub fn delete_key() -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("removing {}", p)),
         }
     }
+    Ok(())
+}
+
+/// Seal the key to PCR7 and write `KEY_TPM_PATH` atomically. Deletes any
+/// plaintext key copies on success — keeping them would defeat the seal.
+pub fn save_key_sealed(key: &[u8; 16]) -> Result<()> {
+    let blob = crate::tpm::seal_key(key).context("sealing key to TPM (PCR7)")?;
+
+    fs::create_dir_all(KEY_DIR).with_context(|| format!("creating {}", KEY_DIR))?;
+    fs::set_permissions(KEY_DIR, fs::Permissions::from_mode(0o700)).ok();
+
+    let tmp = format!("{}.tmp", KEY_TPM_PATH);
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp))?;
+        f.write_all(&blob)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, KEY_TPM_PATH)
+        .with_context(|| format!("renaming {} → {}", tmp, KEY_TPM_PATH))?;
+
+    // Wipe plaintext copies. The whole point of sealing is that the key isn't
+    // sitting in plaintext on disk anymore.
+    delete_key().ok();
+    Ok(())
+}
+
+/// Remove the sealed-key blob. Idempotent.
+pub fn delete_sealed_key() -> Result<()> {
+    match fs::remove_file(KEY_TPM_PATH) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", KEY_TPM_PATH)),
+    }
+}
+
+/// Remove every host-side copy of the key — plaintext and sealed. Used by
+/// `--unpair` and at the start of `--reseal-tpm`.
+pub fn delete_all_keys() -> Result<()> {
+    delete_key()?;
+    delete_sealed_key()?;
     Ok(())
 }
 

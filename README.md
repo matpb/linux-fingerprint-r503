@@ -163,10 +163,38 @@ sudo r503d --status
 # firmware:         fw=1.0 fmt=2
 # firmware paired:  true
 # firmware counter: 42
+# host key.tpm:     (absent)
 # host key:         /var/lib/r503d/key
 # host key.bak:     /var/lib/r503d/key.bak
+# tpm device:       /dev/tpmrm0
 # allow-pair:       (absent)
 ```
+
+### 4b. Optional: seal the host key to the TPM (SPEC §13.12)
+
+On a host with a TPM2 (most Linux desktops + laptops shipped in the last
+~8 years), you can replace the plaintext `/var/lib/r503d/key` file with a
+TPM-sealed blob bound to **PCR7** (Secure Boot policy). Offline-disk
+attackers (`dd` of an unmounted partition, SSD swap into a hostile host)
+get ciphertext only.
+
+```bash
+sudo systemctl stop r503d
+sudo r503d --unpair                        # if previously paired without --seal-tpm
+sudo touch /etc/r503d/allow-pair
+sudo r503d --pair --seal-tpm               # seals new key to current PCR7
+sudo systemctl start r503d
+```
+
+`--seal-tpm` writes `/var/lib/r503d/key.tpm` (mode 0600) and removes the
+plaintext `key` / `key.bak` files. The daemon at boot tries to unseal;
+if PCR7 has changed since pairing (Secure Boot policy edit, MOK enroll,
+disk moved to a different machine) the unseal returns `TPM_RC_POLICY_FAIL`
+and the daemon refuses to start with a clear journal message. Recovery
+is `sudo bash dist/reseal-tpm.sh` (see [Recovery section](#recovery-pcr7-changed-need-to-reseal) below).
+
+Kernel updates, initrd updates, `fwupd` UEFI firmware updates, and grub2
+updates do **not** change PCR7 and do not require a reseal.
 
 ### 5. Enroll & verify
 
@@ -195,6 +223,28 @@ sudo touch /etc/r503d/allow-pair
 sudo r503d --pair                          # fresh random key
 sudo systemctl start r503d
 ```
+
+### Recovery: PCR7 changed, need to reseal
+
+If you used `--pair --seal-tpm` and later changed something that PCR7
+measures (Secure Boot turned off/on, new MOK enrolled, disk moved to
+another box), the daemon will refuse to start with a journal message
+about `TPM_RC_POLICY_FAIL`. Recovery is one command:
+
+```bash
+sudo bash pcside/daemon/dist/reseal-tpm.sh
+```
+
+The script stops `r503d`, reflashes `firmware/r503fp_wipe/` to wipe the
+Nano EEPROM, reflashes the main firmware, creates `/etc/r503d/allow-pair`,
+runs `r503d --reseal-tpm` to generate a fresh key sealed to the *current*
+PCR7, and starts the daemon back up. Wall-clock: ~90 seconds. Enrolled
+fingers are preserved — templates live on the R503 sensor's flash, not
+the Nano.
+
+The script needs `arduino-cli` available. If it's installed in your
+user's `$HOME/.local/bin` it's auto-detected via `$SUDO_USER`; otherwise
+set `ARDUINO_CLI=/full/path/to/arduino-cli` before running.
 
 ### Recovery: lost the host key entirely
 
@@ -284,7 +334,10 @@ not against nation-states or hardware attackers with labs.
   broker layer.
 
 **Not defended:**
-- Host root compromise (key is in `/var/lib/r503d/key`, `0600 root:root`).
+- Host root compromise (key is in `/var/lib/r503d/key`, `0600 root:root`,
+  or `/var/lib/r503d/key.tpm` if you opted in to TPM sealing). TPM
+  sealing does close *offline*-disk attacks (stolen laptop, SSD swap)
+  — see [SPEC §13.12](SPEC.md).
 - Physical attack on the Nano (EEPROM readback ~30 sec with ISP; chip decap; etc.).
 - Firmware-reflash attack (the Arduino bootloader has no signing — but
   re-pairing requires root on the host, so a reflashed Nano can't be

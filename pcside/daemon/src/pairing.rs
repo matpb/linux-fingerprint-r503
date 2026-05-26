@@ -152,29 +152,39 @@ pub fn run_status(port_override: Option<&str>) -> Result<()> {
     let fw_status = parse_status(&raw)?;
     let host_key_present = Path::new(keystore::KEY_PATH).exists();
     let host_bak_present = Path::new(keystore::KEY_BAK_PATH).exists();
+    let host_tpm_present = Path::new(keystore::KEY_TPM_PATH).exists();
     let allow_pair = keystore::allow_pair_present();
+    let tpm_device = crate::tpm::device_present();
 
     println!("port:             {}", port_path);
     println!("firmware:         fw={} fmt={}", fw_status.fw, fw_status.fmt);
     println!("firmware paired:  {}", fw_status.paired);
     println!("firmware counter: {}", fw_status.counter);
+    println!("host key.tpm:     {}",
+        if host_tpm_present { keystore::KEY_TPM_PATH } else { "(absent)" });
     println!("host key:         {}",
         if host_key_present { keystore::KEY_PATH } else { "(missing)" });
     println!("host key.bak:     {}",
         if host_bak_present { keystore::KEY_BAK_PATH } else { "(missing)" });
+    println!("tpm device:       {}",
+        if tpm_device { crate::tpm::TPM_DEVICE } else { "(absent)" });
     println!("allow-pair:       {}",
         if allow_pair { keystore::ALLOW_PAIR_PATH } else { "(absent)" });
 
-    // Surface the consistency-mismatch warnings the operator probably cares about.
-    match (fw_status.paired, host_key_present || host_bak_present) {
+    let host_has_key = host_key_present || host_bak_present || host_tpm_present;
+    match (fw_status.paired, host_has_key) {
         (true, false) => println!("\nWARNING: firmware paired but no host key. Re-pair or reflash-to-wipe."),
         (false, true) => println!("\nWARNING: host key present but firmware unpaired. Stale key — `--unpair` cannot succeed; delete host files manually."),
         _ => {}
     }
+    if host_tpm_present && (host_key_present || host_bak_present) {
+        println!("\nWARNING: both sealed and plaintext key files present. Sealed takes priority; \
+            the plaintext copies are stale and should be removed.");
+    }
     Ok(())
 }
 
-pub fn run_pair(port_override: Option<&str>) -> Result<()> {
+pub fn run_pair(port_override: Option<&str>, seal_tpm: bool) -> Result<()> {
     if !keystore::allow_pair_present() {
         bail!(
             "host opt-in missing: create {} to authorize pairing\n\
@@ -182,6 +192,16 @@ pub fn run_pair(port_override: Option<&str>) -> Result<()> {
             keystore::ALLOW_PAIR_PATH
         );
     }
+    // Sanity check the TPM up front: it's better to bail BEFORE wiping the
+    // allow-pair gate / mutating the Nano than to discover at save-time that
+    // the daemon was running on a host without a TPM.
+    if seal_tpm && !crate::tpm::device_present() {
+        bail!(
+            "--seal-tpm requested but {} not present on this host",
+            crate::tpm::TPM_DEVICE
+        );
+    }
+
     let port_path = match port_override {
         Some(p) => p.to_string(),
         None => sensor::find_port().context("locating R503 serial port")?,
@@ -213,26 +233,91 @@ pub fn run_pair(port_override: Option<&str>) -> Result<()> {
         bail!("paired ok but status still reports paired=false — EEPROM not committed?");
     }
 
-    keystore::save_key(&key).context("saving host key")?;
+    if seal_tpm {
+        keystore::save_key_sealed(&key)
+            .context("sealing host key to TPM (PCR7) and writing key.tpm")?;
+    } else {
+        keystore::save_key(&key).context("saving host key")?;
+    }
     // Fresh state: client counter starts at 1 (Nano's last_seen is 0 post-pair).
     state::save(&state::State::fresh()).context("initializing client counter state")?;
 
     println!("paired: fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
-    println!("host key written to {} (mode 0600)", keystore::KEY_PATH);
-    println!("backup written to {} (mode 0400)", keystore::KEY_BAK_PATH);
+    if seal_tpm {
+        println!(
+            "host key SEALED to TPM (PCR7); blob at {} (mode 0600)",
+            keystore::KEY_TPM_PATH
+        );
+        println!("plaintext key + .bak removed — recovery via `sudo dist/reseal-tpm.sh` if PCR7 changes");
+    } else {
+        println!("host key written to {} (mode 0600)", keystore::KEY_PATH);
+        println!("backup written to {} (mode 0400)", keystore::KEY_BAK_PATH);
+    }
     println!("state initialized at {} (next_cmd_counter=1)", state::STATE_PATH);
     println!("opt-in marker {} closed before key send", keystore::ALLOW_PAIR_PATH);
     Ok(())
 }
 
+/// Reseal recovery flow (SPEC §13.12). Assumes the Nano's EEPROM has been
+/// wiped externally (reflash-to-wipe + reflash of main firmware) — this is
+/// what `dist/reseal-tpm.sh` does before invoking us.
+///
+/// Difference vs `--pair --seal-tpm`: also purges any stale plaintext key,
+/// stale TPM blob, and stale counter state up front. The old host key is
+/// unrecoverable (that's the whole reason we're here), so there's nothing to
+/// preserve.
+pub fn run_reseal_tpm(port_override: Option<&str>) -> Result<()> {
+    if !crate::tpm::device_present() {
+        bail!(
+            "no TPM device present at {} — nothing to reseal against",
+            crate::tpm::TPM_DEVICE
+        );
+    }
+    if !keystore::allow_pair_present() {
+        bail!(
+            "host opt-in missing: create {} before reseal\n\
+             (the reseal flow re-pairs the Nano with a fresh key; same gate as --pair)",
+            keystore::ALLOW_PAIR_PATH
+        );
+    }
+
+    let port_path = match port_override {
+        Some(p) => p.to_string(),
+        None => sensor::find_port().context("locating R503 serial port")?,
+    };
+    let mut link = Link::open(&port_path)?;
+    let pre = parse_status(&link.cmd("status", Duration::from_secs(1))?)?;
+    if pre.paired {
+        bail!(
+            "Nano still reports paired=true — the reseal flow expects a wiped Nano.\n\
+             Run `dist/reseal-tpm.sh` instead of calling --reseal-tpm directly, \
+             or reflash firmware/r503fp_wipe/ + firmware/r503fp/ manually first."
+        );
+    }
+
+    // Stale on-disk state from the prior pairing — keys we can no longer
+    // unwrap, a counter that doesn't match the freshly-wiped Nano. Drop them.
+    keystore::delete_all_keys().ok();
+    state::delete().ok();
+
+    // Now the normal pair-with-seal path.
+    run_pair(port_override, /*seal_tpm=*/ true)
+}
+
 pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
-    let key = keystore::load_key().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no host key at {} or {}; cannot authenticate unpair.\n\
-             For the lost-key case, use reflash-to-wipe (firmware/r503fp_wipe/, Milestone F).",
-            keystore::KEY_PATH, keystore::KEY_BAK_PATH
-        )
-    })?;
+    let (key, source) = keystore::load_key_with_source()
+        .context("loading host key for unpair")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no host key at {} / {} / {}; cannot authenticate unpair.\n\
+                 For the lost-key case, use reflash-to-wipe \
+                 (firmware/r503fp_wipe/, SPEC §13.5).",
+                keystore::KEY_TPM_PATH,
+                keystore::KEY_PATH,
+                keystore::KEY_BAK_PATH
+            )
+        })?;
+    tracing::debug!(?source, "unpair: host key loaded");
     let port_path = match port_override {
         Some(p) => p.to_string(),
         None => sensor::find_port().context("locating R503 serial port")?,
@@ -276,10 +361,10 @@ pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
     if post.paired {
         bail!("unpair ok but status still reports paired=true — EEPROM not committed?");
     }
-    keystore::delete_key().context("removing host key files")?;
+    keystore::delete_all_keys().context("removing host key files")?;
     state::delete().context("removing client counter state")?;
 
     println!("unpaired. fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
-    println!("host key + state files removed.");
+    println!("host key + state files removed (plaintext + sealed).");
     Ok(())
 }
