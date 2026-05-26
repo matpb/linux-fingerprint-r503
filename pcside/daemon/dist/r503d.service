@@ -24,6 +24,10 @@ NoNewPrivileges=true
 DevicePolicy=closed
 DeviceAllow=char-ttyACM rw
 DeviceAllow=char-ttyUSB rw
+# TPM2 resource-managed device — only opened when --pair --seal-tpm has
+# produced a key.tpm blob (SPEC §13.12). Unused on hosts without a TPM and
+# unused on plaintext-key installs.
+DeviceAllow=/dev/tpmrm0 rw
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

@@ -597,9 +597,69 @@ The 64-bit counter itself wraps in geological time; not a concern.
 - **No `r503d --resync`.** If `state.json` is lost while the firmware still has a high `last_seen`, the daemon will hit `ERR replay` on its first send and need a manual wipe-and-re-pair. The fix is a CLI subcommand that reads `last_seen` from a framed `status` (which already returns it) and sets the local counter to `last_seen + 1`. Easy; just not implemented.
 - **No `degraded=true` banner.** The EEPROM all-CRC-fail edge case currently silently degrades to `last_seen = 0`. Should expose this via the boot banner so the daemon can refuse to operate instead of accepting whatever the host sends.
 - **Hand-rolled SipHash, no third-party crypto audit.** The implementations are short and cross-verified against published vectors, but a professional audit would catch things this author wouldn't. PRs welcome from people who actually know what they're doing.
-- **No TPM-sealed key on the host.** The key file is plaintext on disk, protected only by filesystem ACLs. Sealing it to a TPM (via `systemd-cryptenroll` or `tpm2-tools`) would mean offline-disk attacks (stolen laptop, dd of unmounted partition) don't reveal the key. Reasonable v3 enhancement.
+- **TPM seal is opt-in, not default.** Hosts without a TPM2 device, or hosts where the operator hasn't run `--pair --seal-tpm`, still keep the key as plaintext on disk per §13.6. Defaulting on once the TPM path has more bake-in is on the roadmap.
 - **No fuzzing of the firmware frame parser.** The parser is bounds-checked and the input is line-length capped at 128 chars (firmware-side `inbuf` overflow), but I'd feel better about it under a fuzzer.
 - **CH340-based Nano clones have a fixed USB VID/PID.** The daemon can't tell "the right Nano" from "any Nano" without looking at the udev-stable `/dev/r503` symlink (set up by the project's `70-r503.rules`). A genuine Nano (ATmega16U2 USB chip) or a Pro Micro (ATmega32U4 native USB) would allow a custom `iProduct` string for stronger identification. Not blocking.
+
+### 13.12 Host key sealing to TPM2 (opt-in)
+
+**Status: implemented behind `r503d --pair --seal-tpm`.** Adds a TPM2-sealed copy of the SipHash key at `/var/lib/r503d/key.tpm`, replacing the plaintext `key` / `key.bak` files. The seal binds the key to **PCR7** (Secure Boot policy and keys), so the key only unwraps on the same physical machine running with the same Secure Boot configuration.
+
+**Threat closed.** §13.1 explicitly carves out "host root compromise" as out-of-scope (root can always read `/var/lib/r503d/key`), but the plaintext file is also readable in scenarios that *don't* require booting the OS:
+
+- Stolen laptop with SSD pulled and `dd`'d on an attacker's host.
+- Cold-boot image-and-revert against a parked machine.
+- Offline filesystem-level access via any path that doesn't have to satisfy PAM (rescue mode, USB boot, Live ISO with chroot).
+
+With the key sealed, those scenarios get ciphertext. The unwrap key never leaves the TPM, and the TPM only releases it when current PCR values match the policy baked into the sealed object at pairing time.
+
+**PCR choice: PCR7 only.** PCR7 measures Secure Boot policy and the keys that signed the booted EFI binaries. It survives kernel and initrd updates (those don't change SB policy), survives `fwupd` UEFI firmware updates (those measure into PCR0, not PCR7), and survives `dnf upgrade` of grub2/shim. It only changes when:
+
+- Secure Boot is turned off or back on.
+- A new MOK key is enrolled.
+- The SB key database is edited from the UEFI firmware UI.
+- The disk (or SSD) is moved to a different machine with a different SB configuration.
+
+Each of those is something the operator deliberately did or had done to them — exactly the events we want to invalidate the seal for. PCR0 / PCR4 / PCR8 are intentionally not bound, on the principle that operational pain that doesn't buy security is just pain.
+
+**Failure mode.** When PCR7 changes between pair time and boot time, `TPM2_Unseal` returns `TPM_RC_POLICY_FAIL`. The daemon refuses to start with a journal message pointing at the recovery ceremony. PAM falls back to the next configured auth method (typically password). There is **no plaintext fallback**: keeping a plaintext copy alongside the sealed blob would defeat the seal.
+
+**Recovery (the reseal ceremony).** Run `sudo bash dist/reseal-tpm.sh`. The script:
+
+1. Stops `r503d.service`.
+2. Reflashes the Nano with `firmware/r503fp_wipe/` to clear the EEPROM (the old SipHash key on the Nano is paired to the lost host key — both sides have to forget together).
+3. Reflashes the main firmware on top.
+4. Creates `/etc/r503d/allow-pair`.
+5. Runs `r503d --reseal-tpm`, which generates a fresh 128-bit key, pairs the freshly-wiped Nano with it, and seals the new key to **current** PCR7.
+6. Starts `r503d.service`.
+
+Wall-clock: ~90 seconds. Enrolled fingers are preserved — templates live in the R503 sensor's onboard flash, not in the Nano's EEPROM, and not on the host. The user re-logs-in with the same fingers, transparently.
+
+**No new firmware command.** The reseal flow uses the existing reflash-to-wipe path (`firmware/r503fp_wipe/`, §13.5). The running firmware's command surface is unchanged from `fw=1.0`. The capability the wrapper script depends on — "anyone with physical USB access can reflash the Nano" — was already documented in §13.1 bullet 4 as out-of-scope. We're just using it as a deliberate recovery tool.
+
+**Crypto details.**
+
+- **Library:** Rust `tss-esapi` 7.x, linking against system `tpm2-tss` (`/dev/tpmrm0`, the resource-managed TPM device).
+- **Primary key:** Restricted-decryption RSA-2048 on the Owner hierarchy. The Owner Primary Seed is persistent and deterministic across reboots, so the daemon recreates the same primary on each unseal — no need to persist a primary handle.
+- **Sealed object:** `TPM_ALG_KEYEDHASH` with `userWithAuth = false`, `adminWithPolicy = true`. The only path to authorize the unseal is to satisfy the PCR policy.
+- **Policy:** `TPM2_PolicyPCR` over `sha256:7`. Trial session at seal time computes the policy digest, real session at unseal time satisfies it against current PCR7.
+- **On-disk format:** magic `R503TPM\x01` + length-prefixed `Public` (TPM2-marshalled) + length-prefixed `Private` (raw TPM2B buffer). Written atomically (`tmp → fsync → rename`) at mode `0600 root:root`.
+
+**Implementation footprint:**
+
+| Component | Lines |
+|---|---:|
+| `pcside/daemon/src/tpm.rs` | ~310 incl. tests |
+| `pcside/daemon/src/keystore.rs` additions (`load_key_with_source`, `save_key_sealed`, `delete_sealed_key`, `delete_all_keys`) | ~70 |
+| `pcside/daemon/src/pairing.rs` additions (`--seal-tpm` flag wiring, `run_reseal_tpm`) | ~65 |
+| `pcside/daemon/src/main.rs` deltas (CLI flags + boot-time refuse-on-unseal-fail) | ~25 |
+| `pcside/daemon/dist/reseal-tpm.sh` | ~110 |
+
+**What's still out of scope.**
+
+- PCR policy authorization (signed updatable policies, à la systemd-cryptenroll) — would let kernel updates that *do* shift PCRs survive without a reseal. Useful if we ever bind to PCR0/PCR4 too; overkill for PCR7-only.
+- TPM PIN. The operator could attach an additional `userAuth` value so that a thief who steals the running machine *and* the disk still needs a passphrase. Tradeoff is UX (prompted at daemon boot, i.e. at every reboot); rejected for v1 of this feature.
+- Multi-PCR templates (`--pcrs 0,4,7`). The code is structured so this is a one-arg extension if ever wanted.
 
 ---
 

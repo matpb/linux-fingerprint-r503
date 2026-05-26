@@ -14,6 +14,7 @@ mod sensor;
 mod sensor_actor;
 mod state;
 mod storage;
+mod tpm;
 
 use std::path::PathBuf;
 
@@ -58,16 +59,29 @@ struct Args {
 
     /// One-shot: pair an unpaired Nano. Requires /etc/r503d/allow-pair (SPEC §13.5).
     /// Stop the daemon first: `systemctl stop r503d && r503d --pair`.
-    #[arg(long, conflicts_with_all = ["unpair", "status"])]
+    #[arg(long, conflicts_with_all = ["unpair", "status", "reseal_tpm"])]
     pair: bool,
 
+    /// With --pair: seal the generated key to the TPM (PCR7). Replaces the
+    /// plaintext key.bak fallback with key.tpm (SPEC §13.12). On a host
+    /// without a TPM2 device, --pair without this flag stays the default.
+    #[arg(long, requires = "pair")]
+    seal_tpm: bool,
+
     /// One-shot: wipe pairing from the Nano + host (key rotation / decommission).
-    #[arg(long, conflicts_with_all = ["pair", "status"])]
+    #[arg(long, conflicts_with_all = ["pair", "status", "reseal_tpm"])]
     unpair: bool,
 
     /// One-shot: print pairing state from both sides without mutating.
-    #[arg(long, conflicts_with_all = ["pair", "unpair"])]
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "reseal_tpm"])]
     status: bool,
+
+    /// One-shot: recover from a PCR7 policy change (kernel update, Secure Boot
+    /// edit, hardware move). Assumes the Nano EEPROM has been externally wiped
+    /// — the wrapper script `dist/reseal-tpm.sh` handles that. Re-pairs the
+    /// Nano with a fresh key and seals it to current PCR7.
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "status"])]
+    reseal_tpm: bool,
 }
 
 fn default_storage_path(session: bool) -> PathBuf {
@@ -100,10 +114,13 @@ async fn main() -> anyhow::Result<()> {
         return pairing::run_status(args.port.as_deref());
     }
     if args.pair {
-        return pairing::run_pair(args.port.as_deref());
+        return pairing::run_pair(args.port.as_deref(), args.seal_tpm);
     }
     if args.unpair {
         return pairing::run_unpair(args.port.as_deref());
+    }
+    if args.reseal_tpm {
+        return pairing::run_reseal_tpm(args.port.as_deref());
     }
 
     let storage_path = args
@@ -118,17 +135,34 @@ async fn main() -> anyhow::Result<()> {
         "r503d starting"
     );
 
-    // Load host-side key (if paired). Mismatch (key without paired Nano, or
-    // vice versa) is surfaced after the sensor opens and we can compare states.
-    let auth_key = keystore::load_key();
-    if auth_key.is_some() {
-        tracing::info!(
-            key_path = keystore::KEY_PATH,
-            "v2 auth key loaded — sensor will use authenticated channel"
-        );
-    } else {
-        tracing::info!("no v2 auth key found — sensor will use plain v1 protocol");
-    }
+    // Load host-side key (if paired). TPM-aware: if KEY_TPM_PATH exists, we
+    // MUST unseal it — falling back to plaintext would defeat the seal. On
+    // unseal failure (PCR7 mismatch) the daemon refuses to start; the journal
+    // message tells the operator to run the reseal ceremony.
+    let auth_key = match keystore::load_key_with_source() {
+        Ok(Some((k, src))) => {
+            tracing::info!(
+                source = ?src,
+                "v2 auth key loaded — sensor will use authenticated channel"
+            );
+            Some(k)
+        }
+        Ok(None) => {
+            tracing::info!("no v2 auth key found — sensor will use plain v1 protocol");
+            None
+        }
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "FATAL: TPM-sealed key present but could not be unsealed. \
+                 Boot state (PCR7) changed since pairing. \
+                 Recovery: stop r503d, then run `sudo dist/reseal-tpm.sh`. \
+                 Until then, fingerprint login is disabled; PAM will fall \
+                 back to password (SPEC §13.12)."
+            );
+            return Err(e.context("loading host key"));
+        }
+    };
 
     // Open the sensor first — fail fast if the Uno isn't plugged in.
     let sensor = SensorActor::spawn(args.port.clone(), auth_key)

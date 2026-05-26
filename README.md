@@ -67,10 +67,36 @@ pigtail to break the wires out. Brown is sometimes green depending on the
 seller — verify against the wire that goes into the RXD pin of the JST
 header, not the colour.
 
-## Build & install
+## Prerequisites
 
 Tested on Fedora 44 KDE; should work on any systemd-based distro with
-`fprintd`, `pam_fprintd`, and Rust toolchain.
+`fprintd`, `pam_fprintd`, and a recent Rust toolchain.
+
+**System packages:**
+
+| Distro | Build | Runtime |
+|---|---|---|
+| Fedora / RHEL | `rust cargo arduino-cli tpm2-tss-devel` | `fprintd pam fprintd-pam tpm2-tss` |
+| Debian / Ubuntu | `rustc cargo arduino-cli libtss2-dev` | `fprintd libpam-fprintd libtss2-esys-3.0.2-0` |
+
+The `tss-esapi` packages are only needed if you plan to use `--pair --seal-tpm`
+(SPEC §13.12). The daemon builds and runs without a TPM otherwise — `tss-esapi`
+is a hard build dep but a soft runtime dep (the code path is only entered when
+`/var/lib/r503d/key.tpm` exists).
+
+Rust 1.95+, `arduino-cli` on your `$PATH`.
+
+**Do you have a TPM2?**
+
+```bash
+ls /dev/tpmrm0 && tpm2_pcrread sha256:7 | head -3
+```
+
+If both succeed, your host can use the sealed-key path. If `/dev/tpmrm0` is
+missing (older hardware, TPM disabled in BIOS, or a VM without a virtual TPM),
+stick with the default plaintext-key flow.
+
+## Build & install
 
 ### 1. Flash the firmware
 
@@ -136,26 +162,31 @@ redeploy the new binary.
 ### 4. Pair the Nano with the daemon
 
 A freshly-flashed Nano is unpaired — the daemon would talk to it but the
-firmware would reject every framed command. One-time pairing:
+firmware would reject every framed command. **Pick one of the two flows
+below**; both end with a paired Nano and a working daemon. The TPM-sealed
+flow is recommended if your host has a TPM2 (see Prerequisites for the
+quick check).
+
+The opt-in file (`/etc/r503d/allow-pair`) used in both flows exists to
+defeat an attacker racing to your desk with their own Nano — pairing
+without root is impossible. `r503d --pair` deletes the marker **before**
+sending the key to the Nano: if the host crashes between Nano-side commit
+and host-side persistence, the gate is already closed, so the next pair
+attempt requires admin to `touch` the marker again. A pre-send bail
+(no marker, or "already paired") leaves the marker intact for retry.
+
+#### 4a. Plaintext-key pairing (default)
+
+Use this if you don't have a TPM2 device, or if you don't need offline-disk
+attack resistance.
 
 ```bash
 sudo systemctl stop r503d
 sudo mkdir -p /etc/r503d
 sudo touch /etc/r503d/allow-pair          # opt-in (see SPEC §13.5)
-sudo r503d --pair                          # generates a random 128-bit key,
-                                           # writes to /var/lib/r503d/key
+sudo r503d --pair                         # 128-bit key → /var/lib/r503d/key
 sudo systemctl start r503d
 ```
-
-The opt-in file (`/etc/r503d/allow-pair`) exists to defeat an attacker
-racing to your desk with their own Nano — pairing without root is
-impossible. `r503d --pair` deletes the marker **before** sending the
-key to the Nano: if the host crashes between Nano-side commit and
-host-side persistence, the gate is already closed, so the next pair
-attempt requires admin to `touch` the marker again. A pre-send bail
-(no marker, or "already paired") leaves the marker intact for retry.
-
-Check the pairing state anytime:
 
 ```bash
 sudo r503d --status
@@ -163,10 +194,47 @@ sudo r503d --status
 # firmware:         fw=1.0 fmt=2
 # firmware paired:  true
 # firmware counter: 42
+# host key.tpm:     (absent)
 # host key:         /var/lib/r503d/key
 # host key.bak:     /var/lib/r503d/key.bak
+# tpm device:       (absent)
 # allow-pair:       (absent)
 ```
+
+#### 4b. TPM-sealed pairing (recommended on TPM2 hosts, SPEC §13.12)
+
+Same flow, plus `--seal-tpm`. The generated key is sealed to **PCR7**
+(Secure Boot policy + keys) and written to `/var/lib/r503d/key.tpm`
+instead of the plaintext `key` file. Offline-disk attackers (`dd` of an
+unmounted partition, SSD swap into a hostile host) get ciphertext only.
+
+```bash
+sudo systemctl stop r503d
+sudo mkdir -p /etc/r503d
+sudo touch /etc/r503d/allow-pair
+sudo r503d --pair --seal-tpm              # seals new key to current PCR7
+sudo systemctl start r503d
+```
+
+```bash
+sudo r503d --status
+# port:             /dev/r503
+# firmware:         fw=1.0 fmt=2
+# firmware paired:  true
+# firmware counter: 12
+# host key.tpm:     /var/lib/r503d/key.tpm
+# host key:         (missing)
+# host key.bak:     (missing)
+# tpm device:       /dev/tpmrm0
+# allow-pair:       (absent)
+```
+
+Kernel updates, initrd updates, `fwupd` UEFI firmware updates, and grub2
+updates do **not** change PCR7 and do not require a reseal. PCR7 only
+changes on Secure Boot policy edits, MOK enrollments, or moving the disk
+to a different host — at which point the daemon refuses to start with
+`TPM_RC_POLICY_FAIL` and `dist/reseal-tpm.sh` recovers in ~90 seconds.
+See [Recovery: PCR7 changed](#recovery-pcr7-changed-need-to-reseal).
 
 ### 5. Enroll & verify
 
@@ -192,16 +260,45 @@ If you want a fresh key (key compromised, planned hardware swap, paranoia):
 sudo systemctl stop r503d
 sudo r503d --unpair                        # framed; wipes Nano EEPROM + host key
 sudo touch /etc/r503d/allow-pair
-sudo r503d --pair                          # fresh random key
+sudo r503d --pair                          # plaintext-key rotation
+#  - or -
+sudo r503d --pair --seal-tpm               # TPM-sealed rotation
 sudo systemctl start r503d
 ```
 
+**Match your original pairing path.** If you originally used `--seal-tpm`,
+rotate with `--seal-tpm` — otherwise the rotation silently downgrades you
+to a plaintext key on disk.
+
+### Recovery: PCR7 changed, need to reseal
+
+If you used `--pair --seal-tpm` and later changed something that PCR7
+measures (Secure Boot turned off/on, new MOK enrolled, disk moved to
+another box), the daemon will refuse to start with a journal message
+about `TPM_RC_POLICY_FAIL`. Recovery is one command:
+
+```bash
+sudo bash pcside/daemon/dist/reseal-tpm.sh
+```
+
+The script stops `r503d`, reflashes `firmware/r503fp_wipe/` to wipe the
+Nano EEPROM, reflashes the main firmware, creates `/etc/r503d/allow-pair`,
+runs `r503d --reseal-tpm` to generate a fresh key sealed to the *current*
+PCR7, and starts the daemon back up. Wall-clock: ~90 seconds. Enrolled
+fingers are preserved — templates live on the R503 sensor's flash, not
+the Nano.
+
+The script needs `arduino-cli` available. If it's installed in your
+user's `$HOME/.local/bin` it's auto-detected via `$SUDO_USER`; otherwise
+set `ARDUINO_CLI=/full/path/to/arduino-cli` before running.
+
 ### Recovery: lost the host key entirely
 
-The authenticated `--unpair` needs the key to authorize. If
-`/var/lib/r503d/key` AND `/var/lib/r503d/key.bak` are both gone (disk
-crash, accidental rm, etc.), you need the **reflash-to-wipe** escape
-hatch:
+The authenticated `--unpair` needs the key to authorize. If all the
+on-disk copies are gone (disk crash, accidental rm, both `key` + `key.bak`
+deleted, or `key.tpm` blob lost), you need the **reflash-to-wipe** escape
+hatch — same procedure that `dist/reseal-tpm.sh` automates for the
+PCR7-changed case above:
 
 ```bash
 sudo systemctl stop r503d
@@ -282,9 +379,16 @@ not against nation-states or hardware attackers with labs.
   finger) — caller identity is checked on every `username`-taking D-Bus
   method, and the system bus policy denies non-`wheel` callers at the
   broker layer.
+- **Offline-disk attacks on the host key** *when paired with `--seal-tpm`*:
+  the key on disk is TPM2-sealed to PCR7, so `dd` of an unmounted
+  partition or SSD swap into a hostile host yields ciphertext only.
+  Unwraps only on the same machine under the same Secure Boot policy.
+  See [SPEC §13.12](SPEC.md).
 
 **Not defended:**
 - Host root compromise (key is in `/var/lib/r503d/key`, `0600 root:root`).
+  Root on a running host can unseal the TPM-sealed variant too — sealing
+  blunts *offline* attacks, not online ones.
 - Physical attack on the Nano (EEPROM readback ~30 sec with ISP; chip decap; etc.).
 - Firmware-reflash attack (the Arduino bootloader has no signing — but
   re-pairing requires root on the host, so a reflashed Nano can't be
