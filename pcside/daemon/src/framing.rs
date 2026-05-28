@@ -14,6 +14,7 @@
 #![allow(dead_code)] // wired into sensor.rs at Milestone E cutover
 
 use crate::crypto;
+use subtle::ConstantTimeEq;
 
 const MAC_HEX_LEN: usize = 16;
 const MAC_SUFFIX_LEN: usize = 3 + MAC_HEX_LEN; // " M " + 16 hex
@@ -63,13 +64,13 @@ pub fn verify_command<'a>(
     let (counter, cmd_line, claimed) = parse_command(line)?;
     let mac_input = format!("CMD {} {}", counter, cmd_line);
     let expected = crypto::siphash24(key, mac_input.as_bytes());
-    // XOR + zero-check rather than `!=`: the equality compare on Rust u64s
-    // is allowed to short-circuit byte-by-byte in theory, even if today's
-    // codegen on the platforms we care about doesn't. The XOR collapses
-    // both 8-byte MACs to a single u64 difference whose computation is
-    // unconditionally constant-time. Audit §P1-3 / §S5.1.
-    let diff = expected ^ claimed;
-    if diff != 0 {
+    // `subtle::ConstantTimeEq` is the canonical constant-time equality on the
+    // host side. The previous XOR + branch-on-zero was *intended* constant-
+    // time but Rust gives no codegen guarantee; `ct_eq` is the standard
+    // mitigation. Crypto-posture review item #1 (P1). Mirrored on firmware
+    // (`framing.h::verify_command_frame`) via XOR-OR over 8 bytes — safe in
+    // C++ because both sides write to the same accumulator unconditionally.
+    if !bool::from(expected.ct_eq(&claimed)) {
         return Err(FramingError::MacMismatch);
     }
     Ok((counter, cmd_line))
@@ -101,10 +102,10 @@ pub fn parse_response(line: &str) -> Result<(u64, u32, &str, u64), FramingError>
         .ok_or(FramingError::WrongLeader { expected: 'R' })?;
     let (head, mac) = split_mac_suffix(rest)?;
     let sp1 = head.find(' ').ok_or(FramingError::TooShort(head.len()))?;
-    let counter: u64 = head[..sp1].parse().map_err(|_| FramingError::InvalidCounter)?;
+    let counter = parse_strict_u64(&head[..sp1]).ok_or(FramingError::InvalidCounter)?;
     let rest1 = &head[sp1 + 1..];
     let sp2 = rest1.find(' ').ok_or(FramingError::TooShort(rest1.len()))?;
-    let seq: u32 = rest1[..sp2].parse().map_err(|_| FramingError::InvalidSeq)?;
+    let seq = parse_strict_u32(&rest1[..sp2]).ok_or(FramingError::InvalidSeq)?;
     let body = &rest1[sp2 + 1..];
     Ok((counter, seq, body, mac))
 }
@@ -117,9 +118,8 @@ pub fn verify_response<'a>(
     let (counter, seq, body, claimed) = parse_response(line)?;
     let mac_input = format!("RSP {} {} {}", counter, seq, body);
     let expected = crypto::siphash24(key, mac_input.as_bytes());
-    // See `verify_command` for the constant-time-XOR rationale (§S5.1).
-    let diff = expected ^ claimed;
-    if diff != 0 {
+    // See `verify_command` for the `subtle::ConstantTimeEq` rationale.
+    if !bool::from(expected.ct_eq(&claimed)) {
         return Err(FramingError::MacMismatch);
     }
     Ok((counter, seq, body))
@@ -131,7 +131,16 @@ fn split_mac_suffix(s: &str) -> Result<(&str, u64), FramingError> {
     if s.len() < MAC_SUFFIX_LEN {
         return Err(FramingError::TooShort(s.len()));
     }
-    let (head, suffix) = s.split_at(s.len() - MAC_SUFFIX_LEN);
+    // Wire input is technically arbitrary bytes — a hostile MITM could
+    // inject non-ASCII garbage. Lossy UTF-8 conversion replaces bad bytes
+    // with `\u{FFFD}` (3 UTF-8 bytes), which means `s.len() - 19` can land
+    // inside a multi-byte char; `split_at` would panic. Reject before
+    // touching the slice. Crypto-posture review item caught by fuzzer.
+    let split_at = s.len() - MAC_SUFFIX_LEN;
+    if !s.is_char_boundary(split_at) {
+        return Err(FramingError::MissingMacSuffix);
+    }
+    let (head, suffix) = s.split_at(split_at);
     if !suffix.starts_with(" M ") {
         return Err(FramingError::MissingMacSuffix);
     }
@@ -142,8 +151,30 @@ fn split_mac_suffix(s: &str) -> Result<(&str, u64), FramingError> {
 
 fn split_counter_body(s: &str) -> Result<(u64, &str), FramingError> {
     let sp = s.find(' ').ok_or(FramingError::TooShort(s.len()))?;
-    let counter: u64 = s[..sp].parse().map_err(|_| FramingError::InvalidCounter)?;
+    let counter = parse_strict_u64(&s[..sp]).ok_or(FramingError::InvalidCounter)?;
     Ok((counter, &s[sp + 1..]))
+}
+
+/// Strict decimal `u64` parser. Rejects empty, sign chars, non-digit bytes,
+/// and leading zeros (except exact "0"). The strictness closes a parser-
+/// hygiene gap from the §13 review: stdlib `u64::from_str` accepts "042",
+/// which after re-format-for-MAC-compute equals the MAC over "42", so a
+/// captured `C 42 ... M xyz` could be reshaped to `C 042 ... M xyz` and pass
+/// MAC verify. The replay counter check blocks the actual attack, but a
+/// strict parser removes the surface entirely.
+fn parse_strict_u64(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.is_empty() { return None; }
+    if b.len() > 1 && b[0] == b'0' { return None; }
+    for &c in b {
+        if !c.is_ascii_digit() { return None; }
+    }
+    s.parse().ok()
+}
+
+fn parse_strict_u32(s: &str) -> Option<u32> {
+    let v = parse_strict_u64(s)?;
+    if v > u32::MAX as u64 { None } else { Some(v as u32) }
 }
 
 fn parse_mac_hex(hex: &str) -> Result<u64, FramingError> {
@@ -289,6 +320,48 @@ mod tests {
         let cmd_mac = &cmd_frame[cmd_frame.len() - MAC_HEX_LEN..];
         let resp_mac = &resp_frame[resp_frame.len() - MAC_HEX_LEN..];
         assert_ne!(cmd_mac, resp_mac, "domain separation broken");
+    }
+
+    #[test]
+    fn strict_parser_rejects_leading_zero_counter() {
+        // Build a valid frame at counter=42, then re-write the visible counter
+        // token as "042". Stdlib parsing would accept this; the strict parser
+        // must reject before MAC verify is even attempted.
+        let frame = encode_command(&K, 42, "verify 0");
+        let rewritten = frame.replacen("C 42 ", "C 042 ", 1);
+        assert_eq!(
+            verify_command(&K, &rewritten).unwrap_err(),
+            FramingError::InvalidCounter
+        );
+    }
+
+    #[test]
+    fn strict_parser_accepts_zero_counter() {
+        // The exact-"0" case must still pass — it's the legitimate first frame.
+        let frame = encode_command(&K, 0, "ping");
+        let (ctr, cmd) = verify_command(&K, &frame).unwrap();
+        assert_eq!(ctr, 0);
+        assert_eq!(cmd, "ping");
+    }
+
+    #[test]
+    fn strict_parser_rejects_plus_sign() {
+        // stdlib u64::from_str rejects "+42" already, but we re-confirm via the
+        // strict parser path.
+        let frame = encode_command(&K, 42, "verify 0");
+        let rewritten = frame.replacen("C 42 ", "C +42 ", 1);
+        assert!(verify_command(&K, &rewritten).is_err());
+    }
+
+    #[test]
+    fn strict_parser_rejects_leading_zero_seq() {
+        // Response with seq=5 should not validate when the seq token is "05".
+        let frame = encode_response(&K, 42, 5, "OK match=0 confidence=168");
+        let rewritten = frame.replace(" 5 OK", " 05 OK");
+        // Note: this replace may also hit "match=0" parts; check the result is
+        // either parsed-rejected or MAC-rejected — both prove the strictness
+        // works.
+        assert!(verify_response(&K, &rewritten).is_err());
     }
 
     #[test]

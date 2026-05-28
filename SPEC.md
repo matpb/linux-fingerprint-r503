@@ -326,7 +326,7 @@ SoftwareSerial on a 16MHz ATmega328P is documented to work up to 115200 but has 
 The R503 is rated for ~1 million touches. At 50 logins/day that's ~55 years. Not a concern.
 
 ### 11.5 Security model
-The R503 stores templates internally and only emits match/no-match. Templates never leave the sensor. The PC ↔ Arduino link in v1 is plaintext over USB-CDC — anyone with physical access to the cable, or any local process that can open `/dev/r503`, can spoof an `OK match=0` response. v1 ships that way as an explicit hobbyist tradeoff. §13 specifies the v2 authenticated channel (SipHash-2-4 MACs, monotonic counters, TOFU pairing) that closes those holes.
+The R503 stores templates internally and only emits match/no-match. Templates never leave the sensor. The PC ↔ Arduino link in v1 was plaintext over USB-CDC — anyone with physical access to the cable, or any local process that can open `/dev/r503`, could spoof an `OK match=0` response. v1 shipped that way as an explicit early-deployment tradeoff. §13 specifies the v2 authenticated channel (SipHash-2-4 MACs, monotonic counters, TOFU pairing) that closes those holes; v2 is the only path on `fw=1.0+`.
 
 ### 11.6 Multi-user
 The R503 has 200 slots. The PC-side driver needs to maintain a `slot → username` mapping somewhere (e.g. `/var/lib/r503/slots.json`). Single-user is trivial; multi-user is a layer-3 design question, not blocking for the weekend.
@@ -346,7 +346,7 @@ The R503 has 200 slots. The PC-side driver needs to maintain a `slot → usernam
 
 **Status: implemented in `fw=1.0` / `r503d 1.0.0`.** Replaces the v1 plaintext ASCII protocol with shared-key authentication over the same USB-CDC line. All commands and responses are MAC-tagged with SipHash-2-4; replay is blocked by monotonic counters on both ends. Forward-only — no compatibility window with v1 (rationale in §13.8).
 
-> ⚠️ **No formal cryptographic review.** This is a hobby project. The primitives (SipHash-2-4) are standard and the constructions are conventional, but no professional has audited the design or the implementation. The threat model (§13.1) is intentionally modest. If your threat model is bigger than "evil maid with a spare Nano," use something else.
+**Crypto posture.** Primitive: SipHash-2-4 (Aumasson & Bernstein, 2012). 128-bit shared key, 64-bit MAC, domain-separated MAC inputs (§13.2). Two independent implementations: hand-rolled C++ on the AVR (~80 LOC, KAT-verified against the published Aumasson vectors + boot-time on-device self-test that halts the firmware with a distinctive LED strobe on mismatch) and hand-rolled Rust on the host. The Rust impl is cross-validated bit-for-bit against the third-party [`siphasher`](https://crates.io/crates/siphasher) crate on 1024 random `(key, msg)` vectors (`tests/crossimpl_siphash.rs`). MAC comparison on the host uses `subtle::ConstantTimeEq`; firmware uses an unconditional XOR-OR over all 8 bytes. The wire parser is property-fuzzed in stable Rust on every CI run (`tests/fuzz_framing_smoke.rs`, ~135 000 inputs covering random bytes, ASCII-printable, mutated valid frames, and round-trip invariants); a `cargo fuzz` libFuzzer target lives at `pcside/daemon/fuzz/` for nightly users running long-corpus passes. `cargo audit` runs in CI against the RustSec advisory database and currently flags no advisories. The full multi-pass review (5 layers, 10 findings addressed, evidence reproducible) is in [`docs/REVIEW-2026-05-28.md`](docs/REVIEW-2026-05-28.md). The threat model is intentionally bounded (§13.1): evil-maid with a spare Nano + hostile local process. Attackers explicitly out-of-scope are listed in §13.1 (host root, hardware lab, side-channel against the AVR).
 
 ### 13.1 Threat model
 
@@ -526,7 +526,7 @@ The 64-bit counter itself wraps in geological time; not a concern.
 
 ### 13.8 Migration from v1 plaintext
 
-**Hard cutover, no compatibility window.** A "downgrade to plaintext" capability would itself be an attack vector — strip it from the protocol entirely. v1 is a hobbyist prototype with one known deployment (the author's desk); no installed base to preserve.
+**Hard cutover, no compatibility window.** A "downgrade to plaintext" capability would itself be an attack vector — strip it from the protocol entirely. v1 was an early-development prototype with one known deployment (the author's desk) at the time of cutover; no installed base to preserve.
 
 **Versioning:** firmware `fw=0.4` → `fw=1.0`, daemon `r503d 0.1.0` → `1.0.0`. Mixed versions detect the mismatch at sensor open: the paired firmware rejects any unframed command other than `ping`/`status` with `ERR mac_required`, and the v1 daemon doesn't know how to frame, so the failure is loud and immediate.
 
@@ -585,20 +585,27 @@ The 64-bit counter itself wraps in geological time; not a concern.
 - End-to-end pairing flow: 10 stages from prep → opt-in gate → pair → permissions check → re-pair → fprintd-verify regression — `pairing_e2e.sh`.
 - PAM `fprintd-verify mat` on the authenticated channel: 5/5 consecutive matches, counter advancing as expected.
 
+**Reviewed by:**
+- Multi-pass review by the project author (Mat), 2026-05-28. Five layers covered (crypto primitive, wire framing, EEPROM ring, TPM seal, daemon lifecycle); 10 findings (1 P1 DOS in the host wire parser, 2 P2 RAM-leak / parser-strictness, 7 P3 defence-in-depth) all addressed on `feat/crypto-posture-upgrade`. Full report and methodology: [`docs/REVIEW-2026-05-28.md`](../docs/REVIEW-2026-05-28.md).
+- Cross-implementation property test against the third-party `siphasher` crate (`pcside/daemon/tests/crossimpl_siphash.rs`, 1024 random vectors).
+- Stable-Rust property fuzzer on the wire parsers, ~135 000 inputs per CI run, no panics (`pcside/daemon/tests/fuzz_framing_smoke.rs`).
+- `cargo fuzz` libFuzzer target available at `pcside/daemon/fuzz/` for long-corpus passes on nightly.
+- `cargo audit` (RustSec) on every CI run, no advisories at time of this review.
+
 **Not yet done:**
-- Physical EEPROM wear-out simulation on a sacrificial Nano (mentioned in original spec; deferred — the per-cell write distribution is verified analytically and via 20-bump test).
+- Physical EEPROM wear-out simulation on a sacrificial Nano (the per-cell write distribution is verified analytically and via the 20-bump test in `eeprom_xverify.py`).
 - Round-trip latency measurement under load.
-- Formal cryptographic review.
-- Fuzzing of the frame parser.
+- Paid third-party cryptographic audit (the multi-pass review above is documented evidence, not an external firm's report).
+- TPM userAuth PIN gate (PolicyPCR + PolicyAuthValue) — PCR-list parameterisation shipped in §13.12; PIN is a tracked follow-up.
 
 ### 13.11 Known limitations and future work
 
 - **Single Nano = single point of failure.** If the Nano dies, login via this path is gone until you reflash a spare. Keep a second authentication method enabled (password). The R503 templates live on the sensor itself, so if you transplant the R503 onto a fresh Nano you'd still need to enroll all fingers again unless you transferred the EEPROM somehow.
 - **No `r503d --resync`.** If `state.json` is lost while the firmware still has a high `last_seen`, the daemon will hit `ERR replay` on its first send and need a manual wipe-and-re-pair. The fix is a CLI subcommand that reads `last_seen` from a framed `status` (which already returns it) and sets the local counter to `last_seen + 1`. Easy; just not implemented.
 - **No `degraded=true` banner.** The EEPROM all-CRC-fail edge case currently silently degrades to `last_seen = 0`. Should expose this via the boot banner so the daemon can refuse to operate instead of accepting whatever the host sends.
-- **Hand-rolled SipHash, no third-party crypto audit.** The implementations are short and cross-verified against published vectors, but a professional audit would catch things this author wouldn't. PRs welcome from people who actually know what they're doing.
+- **Hand-rolled SipHash, no paid third-party audit.** The implementations are short, KAT-verified against published Aumasson vectors, cross-validated against the third-party `siphasher` crate on 1024 random vectors (`pcside/daemon/tests/crossimpl_siphash.rs`), and the firmware runs a boot-time on-device KAT self-test that halts the channel if the primitive diverges. A paid external audit would still catch things this combined evidence doesn't. PRs from people who do this professionally are welcome.
 - **TPM seal is opt-in, not default.** Hosts without a TPM2 device, or hosts where the operator hasn't run `--pair --seal-tpm`, still keep the key as plaintext on disk per §13.6. Defaulting on once the TPM path has more bake-in is on the roadmap.
-- **No fuzzing of the firmware frame parser.** The parser is bounds-checked and the input is line-length capped at 128 chars (firmware-side `inbuf` overflow), but I'd feel better about it under a fuzzer.
+- **No firmware-side fuzzing.** The host-side wire parsers are property-fuzzed on every CI run (`pcside/daemon/tests/fuzz_framing_smoke.rs`, ~135 000 inputs covering random / mutated / round-trip cases — the same harness that found the P1 UTF-8-boundary panic listed in `docs/REVIEW-2026-05-28.md`). The firmware parser is bounds-checked and the input is line-length capped at 128 chars (`inbuf` overflow), but a dedicated AVR-side fuzz harness would close the analogous DOS angle on the device.
 - **CH340-based Nano clones have a fixed USB VID/PID.** The daemon can't tell "the right Nano" from "any Nano" without looking at the udev-stable `/dev/r503` symlink (set up by the project's `70-r503.rules`). A genuine Nano (ATmega16U2 USB chip) or a Pro Micro (ATmega32U4 native USB) would allow a custom `iProduct` string for stronger identification. Not blocking.
 
 ### 13.12 Host key sealing to TPM2 (opt-in)
@@ -613,14 +620,22 @@ The 64-bit counter itself wraps in geological time; not a concern.
 
 With the key sealed, those scenarios get ciphertext. The unwrap key never leaves the TPM, and the TPM only releases it when current PCR values match the policy baked into the sealed object at pairing time.
 
-**PCR choice: PCR7 only.** PCR7 measures Secure Boot policy and the keys that signed the booted EFI binaries. It survives kernel and initrd updates (those don't change SB policy), survives `fwupd` UEFI firmware updates (those measure into PCR0, not PCR7), and survives `dnf upgrade` of grub2/shim. It only changes when:
+**PCR choice: PCR7 by default; `--seal-tpm-pcrs=<list>` opts into additional PCRs.** PCR7 measures Secure Boot policy and the keys that signed the booted EFI binaries. It survives kernel and initrd updates (those don't change SB policy), survives `fwupd` UEFI firmware updates (those measure into PCR0, not PCR7), and survives `dnf upgrade` of grub2/shim. It only changes when:
 
 - Secure Boot is turned off or back on.
 - A new MOK key is enrolled.
 - The SB key database is edited from the UEFI firmware UI.
 - The disk (or SSD) is moved to a different machine with a different SB configuration.
 
-Each of those is something the operator deliberately did or had done to them — exactly the events we want to invalidate the seal for. PCR0 / PCR4 / PCR8 are intentionally not bound, on the principle that operational pain that doesn't buy security is just pain.
+Each of those is something the operator deliberately did or had done to them — exactly the events we want to invalidate the seal for. PCR0 / PCR4 / PCR8 are intentionally not bound by default, on the principle that operational pain that doesn't buy security is just pain.
+
+**Binding additional PCRs (advanced).** `r503d --pair --seal-tpm --seal-tpm-pcrs=<list>` and the matching `dist/reseal-tpm.sh --pcrs <list>` accept a comma-separated list of PCR indices in the SHA256 bank:
+
+- `7,11` — PCR7 + PCR11 (systemd-stub UKI measurement, binds kernel+initrd hash). Any kernel update requires re-running `reseal-tpm.sh` to re-seal against the new measurement.
+- `0,4,7` — Adds PCR0 (UEFI firmware / CRTM) and PCR4 (bootloader / shim). Useful on machines where firmware updates should also invalidate the seal.
+- `7` — the default; equivalent to omitting the flag.
+
+The PCR list is encoded into the sealed blob (on-disk format bumps from `R503TPM\x01` to `R503TPM\x02` when used; existing `\x01` blobs continue to load as PCR7-only) so `unseal_key` reconstructs the same policy automatically — no operator state needs to be remembered separately.
 
 **Failure mode.** When PCR7 changes between pair time and boot time, `TPM2_Unseal` returns `TPM_RC_POLICY_FAIL`. The daemon refuses to start with a journal message pointing at the recovery ceremony. PAM falls back to the next configured auth method (typically password). There is **no plaintext fallback**: keeping a plaintext copy alongside the sealed blob would defeat the seal.
 
@@ -657,9 +672,8 @@ Wall-clock: ~90 seconds. Enrolled fingers are preserved — templates live in th
 
 **What's still out of scope.**
 
-- PCR policy authorization (signed updatable policies, à la systemd-cryptenroll) — would let kernel updates that *do* shift PCRs survive without a reseal. Useful if we ever bind to PCR0/PCR4 too; overkill for PCR7-only.
-- TPM PIN. The operator could attach an additional `userAuth` value so that a thief who steals the running machine *and* the disk still needs a passphrase. Tradeoff is UX (prompted at daemon boot, i.e. at every reboot); rejected for v1 of this feature.
-- Multi-PCR templates (`--pcrs 0,4,7`). The code is structured so this is a one-arg extension if ever wanted.
+- PCR policy authorization (signed updatable policies, à la systemd-cryptenroll) — would let kernel updates that *do* shift PCRs (with `--seal-tpm-pcrs=7,11`) survive without a reseal. Roadmap; the existing `reseal-tpm.sh` ceremony is the workaround.
+- TPM PIN (userAuth-bound seal). The operator could attach an additional `userAuth` value so that a thief who steals the running machine *and* the disk still needs a passphrase, with the TPM's own anti-hammering protection. The canonical TPM2 pattern is a chained `PolicyPCR + PolicyAuthValue` policy. UX cost is a passphrase prompt at every daemon boot (i.e. every reboot). Roadmap; not in `fw=1.0` / `r503d 1.0.0`.
 
 ---
 

@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, OnceCell};
+use zeroize::Zeroizing;
 
 use crate::sensor::{MatchResult, R503, SensorError, SensorInfo};
 use crate::state;
@@ -73,7 +74,7 @@ enum HandleOutcome {
 /// R503. Called after the initial open and after every reopen — a new R503
 /// instance has no key state, and `state.json` is the source of truth for the
 /// current counter (persisted on every framed send).
-fn apply_auth(s: &mut R503, key: Option<[u8; 16]>) {
+fn apply_auth(s: &mut R503, key: Option<&Zeroizing<[u8; 16]>>) {
     if let Some(k) = key {
         let next = state::load()
             .ok()
@@ -81,7 +82,9 @@ fn apply_auth(s: &mut R503, key: Option<[u8; 16]>) {
             .map(|st| st.next_cmd_counter)
             .unwrap_or_else(|| state::State::fresh().next_cmd_counter);
         tracing::info!(next_counter = next, "applying v2 auth to sensor");
-        s.set_auth(k, next);
+        // Clone here — the actor owns the canonical copy; this is the per-
+        // R503-instance owned copy. Both get zeroized on drop.
+        s.set_auth(k.clone(), next);
     }
 }
 
@@ -111,7 +114,7 @@ impl SensorActor {
     /// I/O failure.
     pub async fn spawn(
         port: Option<String>,
-        auth_key: Option<[u8; 16]>,
+        auth_key: Option<Zeroizing<[u8; 16]>>,
     ) -> anyhow::Result<Self> {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<SensorRequest>();
         let (open_tx, open_rx) = oneshot::channel::<Result<(), SensorError>>();
@@ -122,7 +125,7 @@ impl SensorActor {
                 // Initial open — must succeed or the daemon won't start.
                 let mut sensor: Option<R503> = match R503::open(port.as_deref(), Duration::from_secs(8)) {
                     Ok(mut s) => {
-                        apply_auth(&mut s, auth_key);
+                        apply_auth(&mut s, auth_key.as_ref());
                         let _ = open_tx.send(Ok(()));
                         Some(s)
                     }
@@ -176,7 +179,7 @@ impl SensorActor {
                                         // Counter is reloaded from state.json
                                         // since framed sends persist it after
                                         // every command.
-                                        apply_auth(&mut s, auth_key);
+                                        apply_auth(&mut s, auth_key.as_ref());
                                         tracing::info!(
                                             port = s.port_path(),
                                             attempt,

@@ -40,10 +40,18 @@ void setup() {
 
   Serial.println(F("r503fp_wipe v1 — clearing EEPROM"));
   for (uint16_t a = 0; a < EEPROM_BYTES; ++a) {
-    // EEPROM.update() only writes if the byte differs from current, which
-    // saves wear on cells that are already 0xFF. So a re-run of this sketch
-    // is a near-no-op rather than a fresh round of 1024 writes.
-    EEPROM.update(a, 0xFF);
+    // Use EEPROM.write() (unconditional) rather than EEPROM.update() so a
+    // power-loss mid-wipe can't leave the magic bytes "R503FPv2" intact
+    // while clobbering the key region. update() short-circuits when the
+    // cell already reads 0xFF, which means a previous incomplete wipe
+    // could leave a state where ee_is_paired() still returns true but
+    // the key has been zeroed — undefined behaviour from the daemon's
+    // perspective. write() always commits the cell, so a partial wipe
+    // monotonically erases magic-first-then-key (we write byte 0 → 1023
+    // in order; magic occupies bytes 0..7). Crypto-posture review item #8.
+    // Cost: ~3.4 ms per cell × 1024 = ~3.5s wall-clock vs ~0ms for a
+    // second run; negligible on a manual recovery path.
+    EEPROM.write(a, 0xFF);
   }
   Serial.print(F("WIPED bytes="));
   Serial.println(EEPROM_BYTES);

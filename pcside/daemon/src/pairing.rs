@@ -184,7 +184,11 @@ pub fn run_status(port_override: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn run_pair(port_override: Option<&str>, seal_tpm: bool) -> Result<()> {
+pub fn run_pair(
+    port_override: Option<&str>,
+    seal_tpm: bool,
+    seal_tpm_pcrs: Option<&str>,
+) -> Result<()> {
     if !keystore::allow_pair_present() {
         bail!(
             "host opt-in missing: create {} to authorize pairing\n\
@@ -223,7 +227,7 @@ pub fn run_pair(port_override: Option<&str>, seal_tpm: bool) -> Result<()> {
     // refusal) requires `--unpair` + `touch /etc/r503d/allow-pair` to retry.
     keystore::remove_allow_pair().context("closing allow-pair gate before sending key")?;
 
-    let reply = link.cmd(&format!("pair {}", key_h), Duration::from_secs(2))?;
+    let reply = link.cmd(&format!("pair {}", &*key_h), Duration::from_secs(2))?;
     if reply != "OK paired" {
         bail!("Nano refused pair: {:?}", reply);
     }
@@ -234,8 +238,14 @@ pub fn run_pair(port_override: Option<&str>, seal_tpm: bool) -> Result<()> {
     }
 
     if seal_tpm {
-        keystore::save_key_sealed(&key)
-            .context("sealing host key to TPM (PCR7) and writing key.tpm")?;
+        let pcrs = match seal_tpm_pcrs {
+            Some(s) => crate::tpm::parse_pcr_list(s)
+                .context("parsing --seal-tpm-pcrs")?,
+            None => vec![7],
+        };
+        keystore::save_key_sealed_with_pcrs(&key, &pcrs)
+            .with_context(|| format!(
+                "sealing host key to TPM (PCRs {:?}) and writing key.tpm", pcrs))?;
     } else {
         keystore::save_key(&key).context("saving host key")?;
     }
@@ -244,11 +254,17 @@ pub fn run_pair(port_override: Option<&str>, seal_tpm: bool) -> Result<()> {
 
     println!("paired: fw={} fmt={} counter={}", post.fw, post.fmt, post.counter);
     if seal_tpm {
+        let pcrs_label = seal_tpm_pcrs.unwrap_or("7");
         println!(
-            "host key SEALED to TPM (PCR7); blob at {} (mode 0600)",
+            "host key SEALED to TPM (PCRs {}); blob at {} (mode 0600)",
+            pcrs_label,
             keystore::KEY_TPM_PATH
         );
-        println!("plaintext key + .bak removed — recovery via `sudo dist/reseal-tpm.sh` if PCR7 changes");
+        println!(
+            "plaintext key + .bak removed — recovery via \
+             `sudo dist/reseal-tpm.sh --pcrs {}` if any bound PCR changes",
+            pcrs_label
+        );
     } else {
         println!("host key written to {} (mode 0600)", keystore::KEY_PATH);
         println!("backup written to {} (mode 0400)", keystore::KEY_BAK_PATH);
@@ -266,7 +282,10 @@ pub fn run_pair(port_override: Option<&str>, seal_tpm: bool) -> Result<()> {
 /// stale TPM blob, and stale counter state up front. The old host key is
 /// unrecoverable (that's the whole reason we're here), so there's nothing to
 /// preserve.
-pub fn run_reseal_tpm(port_override: Option<&str>) -> Result<()> {
+pub fn run_reseal_tpm(
+    port_override: Option<&str>,
+    seal_tpm_pcrs: Option<&str>,
+) -> Result<()> {
     if !crate::tpm::device_present() {
         bail!(
             "no TPM device present at {} — nothing to reseal against",
@@ -301,7 +320,7 @@ pub fn run_reseal_tpm(port_override: Option<&str>) -> Result<()> {
     state::delete().ok();
 
     // Now the normal pair-with-seal path.
-    run_pair(port_override, /*seal_tpm=*/ true)
+    run_pair(port_override, /*seal_tpm=*/ true, seal_tpm_pcrs)
 }
 
 pub fn run_unpair(port_override: Option<&str>) -> Result<()> {

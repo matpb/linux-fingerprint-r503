@@ -365,9 +365,13 @@ SPEC.md                      Full architecture + protocol spec (§13 = v2 auth)
 
 ## Security model — quick summary
 
-This is a hobby project. The wire-level authentication is designed against
-a specific threat — **"evil maid with five minutes and a spare Nano"** —
-not against nation-states or hardware attackers with labs.
+The wire-level authentication targets a specific threat —
+**"evil maid with five minutes and a spare Nano"** plus a hostile local
+process on `/dev/r503` — not nation-states or hardware attackers with
+labs. Single-user desktop deployment with a documented out-of-scope list.
+The full threat model lives in [`SPEC.md` §13.1](SPEC.md); the
+implementation-and-review evidence lives in
+[`docs/REVIEW-2026-05-28.md`](docs/REVIEW-2026-05-28.md).
 
 **Defended:**
 - Hot-swap of the Nano with a hostile unit (no key → all frames fail MAC).
@@ -394,10 +398,17 @@ not against nation-states or hardware attackers with labs.
   re-pairing requires root on the host, so a reflashed Nano can't be
   brought into trust without host compromise anyway).
 - R503-side compromise (R30x protocol has no auth at all; out of our scope).
-- **No formal cryptographic review.** The primitives are standard, the
-  constructions are conventional, the implementations are short and
-  cross-verified against published vectors — but no professional has
-  audited the design. PRs welcome.
+- **Crypto posture.** SipHash-2-4 MACs, 128-bit shared key, 64-bit MAC
+  output, domain-separated MAC inputs. Two independent implementations
+  (hand-rolled C++ on the AVR with boot-time KAT self-test; hand-rolled
+  Rust on the host, bit-for-bit cross-validated against the third-party
+  `siphasher` crate on 1024 random vectors in CI). Host MAC compare uses
+  `subtle::ConstantTimeEq`. Wire parsers property-fuzzed on every CI run
+  (~135 000 inputs). `cargo audit` clean. SipHash key wrapped in
+  `zeroize::Zeroizing<...>` so it scrubs on drop. A `cargo fuzz`
+  libFuzzer target ships at `pcside/daemon/fuzz/` for long-corpus runs on
+  nightly. No paid third-party human audit — that would still be
+  valuable, PRs welcome.
 
 Full threat model with rationale: [`SPEC.md` §13.1](SPEC.md).
 

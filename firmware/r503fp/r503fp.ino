@@ -358,12 +358,56 @@ void dispatch(const String& line) {
   else { g_out->print(F("ERR unknown_command ")); g_out->println(line); }
 }
 
+// Boot-time SipHash KAT self-test. Runs 4 canonical Aumasson vectors
+// against the on-board SipHash before the framed channel comes up. On any
+// mismatch (compiler regression, flash corruption, build-config mix-up)
+// we halt with a distinctive 80 ms/80 ms LED strobe + a FATAL serial line,
+// rather than enter the main loop with a quietly-broken MAC primitive.
+// Crypto-posture review item #10 — turns the KAT vectors that already live
+// in the daemon's `crypto.rs` tests into a runtime invariant on the device.
+// Cost: ~120 bytes flash + ~8 ms one-shot at boot.
+bool siphash_kat_ok() {
+  static const uint8_t KEY[16] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+    0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f
+  };
+  struct Vec { uint8_t len; uint8_t want[8]; };
+  static const Vec VECS[] = {
+    { 0,  {0x31,0x0e,0x0e,0xdd,0x47,0xdb,0x6f,0x72}},
+    { 1,  {0xfd,0x67,0xdc,0x93,0xc5,0x39,0xf8,0x74}},
+    { 8,  {0x62,0x24,0x93,0x9a,0x79,0xf5,0xf5,0x93}},
+    {15,  {0xe5,0x45,0xbe,0x49,0x61,0xca,0x29,0xa1}},
+  };
+  uint8_t msg[16];
+  for (uint8_t i = 0; i < 16; ++i) msg[i] = i;
+  for (uint8_t v = 0; v < (uint8_t)(sizeof(VECS)/sizeof(VECS[0])); ++v) {
+    uint64_t mac = r503::siphash24(KEY, msg, VECS[v].len);
+    uint8_t out[8];
+    r503::siphash_to_le_bytes(mac, out);
+    for (uint8_t b = 0; b < 8; ++b) {
+      if (out[b] != VECS[v].want[b]) return false;
+    }
+  }
+  return true;
+}
+
 void setup() {
   pinMode(PIN_WAKE, INPUT);
   pinMode(LED_BUILTIN, OUTPUT);
   Serial.begin(PC_BAUD);
   while (!Serial) { ; }
   delay(500);
+
+  if (!siphash_kat_ok()) {
+    Serial.println(F("FATAL siphash_kat_fail — refusing to enter main loop"));
+    // Strobe ~6 Hz forever. Distinct from r503fp_wipe's 2.5 Hz slow blink
+    // and from normal idle (LED off). Visible as "fast pulse" at a glance.
+    while (1) {
+      digitalWrite(LED_BUILTIN, HIGH); delay(80);
+      digitalWrite(LED_BUILTIN, LOW);  delay(80);
+    }
+  }
+
   Serial.print(F("R503FP READY fw=1.0 paired="));
   Serial.println(r503::ee_is_paired() ? F("true") : F("false"));
   finger.begin(FP_BAUD);
