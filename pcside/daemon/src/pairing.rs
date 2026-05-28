@@ -34,6 +34,14 @@ struct Link {
     rx: Vec<u8>,
 }
 
+/// Human-facing context attached to a reply-timeout error. Takes only the
+/// non-secret `label` (e.g. `pair`, `unpair`, `status`) — NEVER the wire bytes,
+/// which may carry the 128-bit key or a MAC tag. Single source of truth for the
+/// timeout message so the redaction can be asserted by `cargo test` alone.
+fn timeout_context(label: &str) -> String {
+    format!("timeout reading reply to: {}", label)
+}
+
 impl Link {
     fn open(path: &str) -> Result<Self> {
         // .exclusive(true) is the serialport-4.x POSIX default; setting it
@@ -76,17 +84,30 @@ impl Link {
         bail!("could not sync with firmware; last line seen: {:?}", last)
     }
 
+    /// Send a non-secret command whose text is safe to echo in errors/logs
+    /// (e.g. `status`, `ping`). The command string doubles as its own label.
     fn cmd(&mut self, cmd: &str, timeout: Duration) -> Result<String> {
+        self.cmd_labeled(cmd, cmd, timeout)
+    }
+
+    /// Send `wire` bytes to the Nano, but use `label` (never `wire`) in any
+    /// error/log text. Callers that put key material on the wire — the `pair`
+    /// bootstrap (a literal `pair <key-hex>`) and the MAC-framed `unpair`
+    /// (the frame embeds the SipHash tag) — MUST route through this with a
+    /// constant, secret-free label so a reply timeout can never interpolate
+    /// the secret into the anyhow chain that `main` prints to stderr / the
+    /// journal (security audit 2026-05-28 / L-pairing-key-in-error).
+    fn cmd_labeled(&mut self, wire: &str, label: &str, timeout: Duration) -> Result<String> {
         self.rx.clear();
         let _ = self.port.clear(serialport::ClearBuffer::Input);
-        self.port.write_all(cmd.as_bytes())?;
+        self.port.write_all(wire.as_bytes())?;
         self.port.write_all(b"\n")?;
         self.port.flush()?;
         let deadline = Instant::now() + timeout;
         loop {
             let line = self
                 .read_line(deadline.saturating_duration_since(Instant::now()))?
-                .with_context(|| format!("timeout reading reply to: {}", cmd))?;
+                .with_context(|| timeout_context(label))?;
             if line.is_empty() || line.starts_with("PROGRESS ") {
                 continue;
             }
@@ -294,7 +315,9 @@ pub fn run_pair(
     // refusal) requires `--unpair` + `touch /etc/r503d/allow-pair` to retry.
     keystore::remove_allow_pair().context("closing allow-pair gate before sending key")?;
 
-    let reply = link.cmd(&format!("pair {}", &*key_h), Duration::from_secs(2))?;
+    // Wire bytes carry the fresh 128-bit key; the label must not, so a reply
+    // timeout cannot leak the key into the error chain (audit L-pairing-key).
+    let reply = link.cmd_labeled(&format!("pair {}", &*key_h), "pair", Duration::from_secs(2))?;
     if reply != "OK paired" {
         bail!("Nano refused pair: {:?}", reply);
     }
@@ -517,7 +540,9 @@ pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
     .context("persisting client counter before unpair")?;
 
     let frame = framing::encode_command(&key, counter, "unpair");
-    let raw_reply = link.cmd(&frame, Duration::from_secs(2))?;
+    // The frame embeds the SipHash MAC tag; label with the bare verb so a
+    // reply timeout never leaks key-derived material (audit L-pairing-key).
+    let raw_reply = link.cmd_labeled(&frame, "unpair", Duration::from_secs(2))?;
     if !raw_reply.starts_with("R ") {
         bail!(
             "Nano refused framed unpair (unframed reply): {:?}",
@@ -551,4 +576,68 @@ pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
     );
     println!("host key + state files removed (plaintext + sealed).");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keystore;
+
+    // Regression guard for audit finding L-pairing-key-in-error: a reply
+    // timeout during `--pair`/`--unpair` must never interpolate the wire bytes
+    // (which carry the 128-bit key / MAC tag) into the operator-visible error.
+    // `cmd_labeled` is the only path the secret-bearing call sites use, and the
+    // error text is built solely from `timeout_context(label)`.
+
+    #[test]
+    fn timeout_context_uses_label_not_wire_bytes() {
+        // Simulate the exact `pair` call site: wire = "pair <32-hex-key>".
+        let key = keystore::generate_key().unwrap();
+        let key_h = keystore::key_hex(&key);
+        let wire = format!("pair {}", &*key_h);
+
+        let msg = timeout_context("pair");
+
+        assert_eq!(msg, "timeout reading reply to: pair");
+        assert!(
+            !msg.contains(&*key_h),
+            "timeout error leaked the key hex: {msg}"
+        );
+        assert!(
+            !msg.contains(&wire),
+            "timeout error leaked the full pair command: {msg}"
+        );
+    }
+
+    #[test]
+    fn timeout_context_redacts_unpair_frame() {
+        // Simulate the `unpair` call site: wire = MAC-framed command. The frame
+        // embeds the SipHash tag; the label must not.
+        let key = keystore::generate_key().unwrap();
+        let frame = framing::encode_command(&key, 1, "unpair");
+
+        let msg = timeout_context("unpair");
+
+        assert_eq!(msg, "timeout reading reply to: unpair");
+        assert!(
+            !msg.contains(&frame),
+            "timeout error leaked the framed unpair command: {msg}"
+        );
+        // Defensive: no portion of the hex frame body should appear.
+        assert!(
+            frame.len() < 8 || !msg.contains(&frame[frame.len() - 8..]),
+            "timeout error leaked a MAC-tag suffix: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_secret_label_is_preserved_verbatim() {
+        // status/ping route through cmd() which passes the command as its own
+        // label; those are safe and must remain debuggable.
+        assert_eq!(
+            timeout_context("status"),
+            "timeout reading reply to: status"
+        );
+        assert_eq!(timeout_context("ping"), "timeout reading reply to: ping");
+    }
 }
