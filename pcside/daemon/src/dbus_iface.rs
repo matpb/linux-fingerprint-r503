@@ -467,7 +467,17 @@ impl Device {
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
 
-        let my_token = {
+        // Mint the action token AND snapshot the user's slots while holding the
+        // SAME state-lock acquisition. Previously the token was minted under the
+        // lock, the lock dropped, and get_user_slots() read afterwards — leaving
+        // a window in which a same-sender DeleteEnrolledFinger (which is not
+        // action-gated) could mutate the slot set between mint and read. The
+        // race was bounded by ensure_claim (no cross-user privesc; worst case a
+        // verify that naturally fails), but reading the slots under the lock
+        // closes it outright. get_user_slots only touches the independent
+        // storage RwLock, so holding the state mutex across it is deadlock-free
+        // (nothing acquires storage-then-state). (Audit 2026-05-28 / L1.)
+        let (my_token, user_slots) = {
             let mut state = self.state.lock().await;
             if let Some(t) = state.action {
                 return Err(FprintError::AlreadyInUse(format!(
@@ -475,14 +485,14 @@ impl Device {
                     t.kind.as_str()
                 )));
             }
-            state.start_action(ActionKind::Verify)
+            let slots = self.storage.get_user_slots(&user).await;
+            (state.start_action(ActionKind::Verify), slots)
         };
 
         // Build expected_slots + the name we'll advertise via VerifyFingerSelected.
         // For "any", we emit the literal "any" so the UI doesn't lie about which
         // finger the user must place. expected_slots is the union of every
         // enrolled slot, so a match on any of them succeeds.
-        let user_slots = self.storage.get_user_slots(&user).await;
         if user_slots.is_empty() {
             self.state.lock().await.end_action_if_owner(my_token);
             return Err(FprintError::NoEnrolledPrints(format!(
