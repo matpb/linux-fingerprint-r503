@@ -36,8 +36,8 @@ jobs:
             ~/.cargo/git
             pcside/daemon/target
           key: cargo-${{ runner.os }}-${{ hashFiles('pcside/daemon/Cargo.lock') }}
-      - name: Install build deps (tpm2-tss for tss-esapi linkage)
-        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: Install build deps (tpm2-tss for tss-esapi, libudev for serialport)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev libudev-dev
       - name: cargo build
         run: cargo build --all-targets --locked
       - name: cargo test (unit + lib + integration)
@@ -69,6 +69,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install arduino-cli
         run: |
+          # The official install script bails if BINDIR doesn't already exist.
+          mkdir -p "$HOME/.local/bin"
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
             | BINDIR=$HOME/.local/bin sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
