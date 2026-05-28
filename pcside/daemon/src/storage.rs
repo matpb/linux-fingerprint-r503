@@ -11,6 +11,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
+// deny_unknown_fields: a users.json carrying keys we don't recognize is
+// schema drift — a stale file, a buggy migration, or a hostile edit — and is
+// rejected loudly instead of silently dropped (audit 2026-05-28 / M3).
+#[serde(deny_unknown_fields)]
 struct StorageFile {
     /// username -> (finger-name -> slot index in sensor flash)
     users: HashMap<String, HashMap<String, u8>>,
@@ -36,6 +40,8 @@ pub enum StorageError {
     Parse(#[from] serde_json::Error),
     #[error("no free slots (capacity={0})")]
     NoFreeSlot(u16),
+    #[error("insecure mode {mode:o} on {path} (expected 0600)")]
+    InsecureMode { path: String, mode: u32 },
 }
 
 impl Storage {
@@ -44,6 +50,18 @@ impl Storage {
             tokio::fs::create_dir_all(parent).await?;
         }
         let data: StorageFile = if path.exists() {
+            // Refuse a registry file readable/writable by anyone but root.
+            // save() always writes 0600; anything looser leaks who is enrolled
+            // at which slot (recon for a templated-finger attack) or signals
+            // tampering (audit 2026-05-28 / M3).
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = tokio::fs::metadata(&path).await?.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(StorageError::InsecureMode {
+                    path: path.display().to_string(),
+                    mode,
+                });
+            }
             let raw = tokio::fs::read(&path).await?;
             serde_json::from_slice(&raw)?
         } else {

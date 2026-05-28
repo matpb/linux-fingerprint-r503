@@ -14,8 +14,8 @@
 
 use anyhow::{bail, Context, Result};
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use zeroize::Zeroizing;
 
@@ -51,15 +51,75 @@ pub fn remove_allow_pair() -> Result<()> {
     }
 }
 
+/// Read a key file with belt-and-suspenders DAC checks (audit 2026-05-28 / M2).
+///
+/// `/var/lib/r503d` is created `0700 root`, so a non-root attacker cannot
+/// pre-stage a symlink or a loose-mode file there to begin with. These checks
+/// make the load path defend itself anyway, so a compromised post-install
+/// hook, an installer race, or an unrelated root-as-user service with a
+/// path-traversal bug cannot turn `load_key` into an arbitrary-file read
+/// (e.g. a symlink to `/etc/shadow`) or sneak in a group/other-readable key:
+///
+///   - `symlink_metadata` (does NOT follow links) + reject symlinks.
+///   - reject any file not owned by uid 0.
+///   - reject any access bit outside `allow_mask` (group/other, and for the
+///     backup, owner-write too).
+///   - open with `O_NOFOLLOW` so a symlink swapped in after the stat still
+///     fails the open rather than being followed.
+///
+/// Returns the file contents wrapped in `Zeroizing` (just as sensitive as the
+/// parsed bytes). `None` on any failed check — load_key falls through to the
+/// next candidate exactly as before.
+fn read_key_file_guarded(path: &str, allow_mask: u32) -> Option<Zeroizing<String>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "stat of key file failed; ignoring");
+            return None;
+        }
+    };
+    if meta.file_type().is_symlink() {
+        tracing::warn!(path, "key file is a symlink; refusing to follow (M2)");
+        return None;
+    }
+    if meta.uid() != 0 {
+        tracing::warn!(path, uid = meta.uid(), "key file not owned by root; ignoring (M2)");
+        return None;
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & allow_mask != 0 {
+        tracing::warn!(path, mode = format!("{:o}", mode), "key file has insecure mode; ignoring (M2)");
+        return None;
+    }
+    let mut f = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "opening key file (O_NOFOLLOW) failed; ignoring");
+            return None;
+        }
+    };
+    let mut s = Zeroizing::new(String::new());
+    if let Err(e) = f.read_to_string(&mut s) {
+        tracing::warn!(path, error = %e, "reading key file failed; ignoring");
+        return None;
+    }
+    Some(s)
+}
+
 pub fn load_key() -> Option<Zeroizing<[u8; 16]>> {
-    for p in [KEY_PATH, KEY_BAK_PATH] {
-        if let Ok(s) = fs::read_to_string(p) {
-            // Wrap the hex form too — it's just as sensitive as the bytes
-            // and lives on the heap until the trim()'d slice is parsed.
-            let hex = Zeroizing::new(s);
-            if let Ok(k) = parse_key_hex(hex.trim()) {
-                return Some(k);
-            }
+    // Live key must be 0600 (no group/other); backup must be 0400 (no
+    // owner-write either, hence the wider 0o177 mask). Both must be a
+    // root-owned regular file — see read_key_file_guarded.
+    for (p, allow_mask) in [(KEY_PATH, 0o077u32), (KEY_BAK_PATH, 0o177u32)] {
+        if let Some(hex) = read_key_file_guarded(p, allow_mask)
+            && let Ok(k) = parse_key_hex(hex.trim())
+        {
+            return Some(k);
         }
     }
     None

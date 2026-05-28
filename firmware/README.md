@@ -64,6 +64,12 @@ out and back in (to pick up the `dialout` group membership) or prefix with
 udev rule that creates `/dev/r503` as a stable symlink — once installed,
 use `--port /dev/r503` regardless of which `ttyUSB*` the kernel picked.
 
+**Note:** that same udev rule locks the device node to `root:root 0600`
+(security audit 2026-05-28 / H1), so the `dialout`-group shortcut no longer
+applies to `/dev/r503` once the daemon is installed — flashing or opening a
+serial monitor on it requires `sudo` (and stopping `r503d` first, since the
+daemon holds the port exclusively with `TIOCEXCL`).
+
 **EEPROM persists across reflash.** The 16-byte key + counter ring + format
 marker live in the ATmega328P's 1 KB EEPROM, which `arduino-cli upload`
 does not touch. A paired Nano stays paired after you reflash `r503fp/`.

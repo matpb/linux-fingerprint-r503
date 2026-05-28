@@ -1,0 +1,1268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>r503-fpr — Adversarial Security Audit · 2026-05-28</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a22;
+    --panel-2: #1c2230;
+    --ink: #e6e8ec;
+    --muted: #9aa3b2;
+    --rule: #2a3142;
+    --accent: #7aa2ff;
+    --accent-soft: #2a3a66;
+    --ok: #58c184;
+    --info: #6aa8ff;
+    --low: #d8c66e;
+    --med: #e8a857;
+    --high: #f06c5b;
+    --crit: #ff3b5c;
+    --code-bg: #0b0d12;
+    --code-fg: #d8e1f3;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 56px 28px 88px; }
+  header.hero {
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 28px;
+    margin-bottom: 36px;
+  }
+  header.hero .eyebrow {
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 11px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  header.hero h1 {
+    font-size: 38px;
+    line-height: 1.15;
+    margin: 10px 0 8px;
+    letter-spacing: -0.01em;
+  }
+  header.hero .sub {
+    color: var(--muted);
+    font-size: 15px;
+  }
+  header.hero .meta {
+    margin-top: 18px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--panel);
+  }
+  header.hero .meta div {
+    padding: 14px 16px;
+    border-right: 1px solid var(--rule);
+  }
+  header.hero .meta div:last-child { border-right: 0; }
+  header.hero .meta .k {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 4px;
+  }
+  header.hero .meta .v { font-weight: 600; }
+
+  h2 {
+    font-size: 22px;
+    letter-spacing: -0.005em;
+    margin: 44px 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--rule);
+  }
+  h3 {
+    font-size: 17px;
+    margin: 24px 0 10px;
+    color: var(--ink);
+  }
+  p { color: var(--ink); }
+  a { color: var(--accent); }
+  code, kbd {
+    font: 13px/1.5 ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 1px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--rule);
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 14px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--rule);
+    overflow-x: auto;
+    font: 13px/1.55 ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  /* Summary table */
+  table.summary {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  table.summary th, table.summary td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  table.summary th {
+    background: var(--panel-2);
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 600;
+  }
+  table.summary tr:last-child td { border-bottom: 0; }
+  table.summary td.id a { text-decoration: none; }
+  table.summary td.id a:hover { text-decoration: underline; }
+
+  /* Severity badges */
+  .sev {
+    display: inline-block;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    border-radius: 4px;
+    text-transform: uppercase;
+    border: 1px solid currentColor;
+  }
+  .sev-CRITICAL { color: var(--crit); background: rgba(255,59,92,0.10); }
+  .sev-HIGH     { color: var(--high); background: rgba(240,108,91,0.10); }
+  .sev-MEDIUM   { color: var(--med);  background: rgba(232,168,87,0.10); }
+  .sev-LOW      { color: var(--low);  background: rgba(216,198,110,0.10); }
+  .sev-INFO     { color: var(--info); background: rgba(106,168,255,0.10); }
+  .sev-OK       { color: var(--ok);   background: rgba(88,193,132,0.10); }
+
+  /* Stats cards */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    margin: 18px 0 28px;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .stat .n { font-size: 28px; font-weight: 700; line-height: 1; }
+  .stat .l {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); margin-top: 6px;
+  }
+  .stat.crit .n { color: var(--crit); }
+  .stat.high .n { color: var(--high); }
+  .stat.med  .n { color: var(--med); }
+  .stat.low  .n { color: var(--low); }
+  .stat.info .n { color: var(--info); }
+
+  /* Finding cards */
+  .finding {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-left: 4px solid var(--rule);
+    border-radius: 8px;
+    margin: 18px 0;
+    padding: 18px 22px 6px;
+  }
+  .finding.CRITICAL { border-left-color: var(--crit); }
+  .finding.HIGH     { border-left-color: var(--high); }
+  .finding.MEDIUM   { border-left-color: var(--med); }
+  .finding.LOW      { border-left-color: var(--low); }
+  .finding.INFO     { border-left-color: var(--info); }
+  .finding .head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .finding .head h3 {
+    margin: 0;
+    font-size: 17px;
+  }
+  .finding .head .id-tag {
+    font: 11px/1.4 ui-monospace, SFMono-Regular, monospace;
+    color: var(--muted);
+  }
+  .finding .head .path {
+    margin-left: auto;
+    font: 12px/1.4 ui-monospace, SFMono-Regular, monospace;
+    color: var(--muted);
+  }
+  .finding dl {
+    display: grid;
+    grid-template-columns: 130px 1fr;
+    gap: 6px 16px;
+    margin: 14px 0 8px;
+  }
+  .finding dt {
+    color: var(--muted);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding-top: 2px;
+  }
+  .finding dd { margin: 0 0 6px; }
+
+  /* Callouts */
+  .callout {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 18px 0;
+  }
+  .callout.ok { border-left: 4px solid var(--ok); }
+  .callout.warn { border-left: 4px solid var(--med); }
+  .callout.info { border-left: 4px solid var(--info); }
+  .callout h4 {
+    margin: 0 0 6px;
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+
+  ul.tight { margin: 8px 0 16px; padding-left: 22px; }
+  ul.tight li { margin: 4px 0; }
+
+  footer {
+    margin-top: 60px;
+    padding-top: 22px;
+    border-top: 1px solid var(--rule);
+    color: var(--muted);
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">Adversarial Security Audit</div>
+  <h1>r503-fpr — Privilege-Escalation, Spoofing & Impersonation Sweep</h1>
+  <div class="sub">
+    Full-codebase audit of the R503 fingerprint reader stack: firmware on AVR,
+    Rust daemon owning <code>net.reactivated.Fprint</code>, install / dist
+    scripts, polkit + D-Bus + systemd surface, TPM-sealed key path.
+  </div>
+  <div class="meta">
+    <div><div class="k">Repository</div><div class="v">linux-fingerprint-r503</div></div>
+    <div><div class="k">Branch / HEAD</div><div class="v">main · 10a991c</div></div>
+    <div><div class="k">Audit date</div><div class="v">2026-05-28</div></div>
+    <div><div class="k">Scope</div><div class="v">Privesc · Spoofing · Impersonation</div></div>
+  </div>
+</header>
+
+<h2>Executive Summary</h2>
+
+<p>
+  The r503-fpr daemon has been substantially hardened since the initial security
+  pass (see commits <code>S1</code>–<code>S9</code> + <code>feat/tpm-seal</code>
+  + <code>feat/crypto-posture-upgrade</code> on <code>main</code>). The
+  authenticated wire protocol (SipHash-2-4, monotonic counter, EEPROM-persisted
+  replay defence) is implemented correctly on both sides, MAC comparison is
+  constant-time, the D-Bus policy is deny-by-default + wheel-only, and the
+  systemd unit applies an aggressive set of confinement directives
+  (<code>CapabilityBoundingSet=</code>, <code>PrivateNetwork=true</code>,
+  <code>SystemCallFilter=@system-service</code>, etc.).
+</p>
+
+<p>
+  This audit re-enters the codebase hostile, looking specifically for ways a
+  <em>local</em> non-root user, a wheel-group user, or a process inheriting any
+  of the device-node groups can (a) gain root via the fingerprint path,
+  (b) impersonate another user to <code>sudo</code> / <code>kscreenlocker</code>
+  / SDDM, or (c) recover the shared SipHash key. Physical access and pre-existing
+  root are out of scope per the requesting policy.
+</p>
+
+<p>
+  <strong>Result.</strong> No critical privilege-escalation paths were found.
+  One <span class="sev sev-HIGH">HIGH</span> issue clusters around the serial-port
+  access boundary: <code>/dev/r503</code> inherits a permissive group from the
+  OS default because the udev rule omits <code>MODE=</code> / <code>GROUP=</code>,
+  and the daemon does not open the port with <code>TIOCEXCL</code>. Four
+  <span class="sev sev-MEDIUM">MEDIUM</span> findings are defense-in-depth gaps
+  (unbounded RX buffer, missing file-mode/symlink checks on the host key file,
+  no <code>deny_unknown_fields</code> on persisted JSON). The remainder are
+  <span class="sev sev-LOW">LOW</span> or <span class="sev sev-INFO">INFO</span>
+  — code-hygiene polish, parser edge cases, and clarifications where earlier
+  auditors over-rated severity.
+</p>
+
+<div class="stats">
+  <div class="stat crit"><div class="n">0</div><div class="l">Critical</div></div>
+  <div class="stat high"><div class="n">1</div><div class="l">High</div></div>
+  <div class="stat med"><div class="n">5</div><div class="l">Medium</div></div>
+  <div class="stat low"><div class="n">7</div><div class="l">Low</div></div>
+  <div class="stat info"><div class="n">5</div><div class="l">Info / Reclassified</div></div>
+</div>
+
+<h2>Scope &amp; Threat Model</h2>
+
+<p>
+  We assume an attacker who:
+</p>
+<ul class="tight">
+  <li>Has a local shell account on the host with no special privileges, OR
+      a non-root account that happens to be in <code>dialout</code> /
+      <code>uucp</code> / <code>tty</code> (whatever default group owns
+      <code>/dev/ttyACM*</code> / <code>/dev/ttyUSB*</code> on the distro), OR
+      a wheel-group account.</li>
+  <li>Can connect to the system D-Bus and call any method the policy permits.</li>
+  <li>Can open any device node the OS DAC mode permits.</li>
+  <li>Has read access to any world-readable file.</li>
+</ul>
+<p>
+  Explicitly <em>out of scope</em> per the brief: physical access to the
+  device, pre-existing root, hardware lab attacks on the AVR, downstream
+  compromise of PAM / kernel / systemd, and TPM side channels. We use the
+  threat model from <a href="../SPEC.md">SPEC.md §13.1</a> as the baseline
+  and stretch it where the host-side surface has been hardened past the
+  original assumptions.
+</p>
+
+<p>The attacker's goals we test against:</p>
+<ul class="tight">
+  <li>Enroll one of their own fingers under another user's identity (sudo / SDDM bypass).</li>
+  <li>Cause a <code>verify</code> to be misattributed to the wrong user.</li>
+  <li>Recover the 128-bit shared SipHash key from disk, memory, or wire.</li>
+  <li>Replay a captured <code>OK match=…</code> response to extend an auth window.</li>
+  <li>Deny service to the legitimate user (lock them out of fingerprint auth) <em>and</em>
+      keep that within a stealth budget that doesn't trigger the password fallback being noticed.</li>
+</ul>
+
+<h2>Methodology</h2>
+
+<p>
+  Six parallel auditors were dispatched against disjoint slices of the
+  codebase, briefed adversarially and instructed to return structured findings.
+  Their reports were then re-verified by direct inspection of the source — the
+  highest-severity claims (a "CRITICAL" delete-no-claim path, a "HIGH" verify
+  slot race, a "MEDIUM" TPM Owner-hierarchy bypass) were re-classified after
+  reading the actual code: each turned out to be intentional design or guarded
+  by a non-obvious gate the auditor missed. The audit therefore reports
+  fewer issues than the raw subagent dump but each one survived a hostile
+  second pass.
+</p>
+
+<p>Files in scope:</p>
+<pre>firmware/r503fp/{r503fp.ino, framing.h, siphash.h, eeprom.h}
+firmware/r503fp_wipe/r503fp_wipe.ino
+pcside/daemon/src/{auth.rs, crypto.rs, dbus_iface.rs, error.rs, framing.rs,
+                   keystore.rs, lib.rs, main.rs, pairing.rs, sensor.rs,
+                   sensor_actor.rs, state.rs, storage.rs, tpm.rs}
+pcside/daemon/dist/{install.sh, uninstall.sh, reseal-tpm.sh, r503d.service,
+                    net.reactivated.Fprint.{service,conf},
+                    net.reactivated.fprint.device.r503d.policy, 70-r503.rules}
+pcside/daemon/Cargo.toml
+SPEC.md §13 (threat model + cryptographic posture)</pre>
+
+<h2>Findings — Summary Table</h2>
+
+<table class="summary">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Severity</th>
+      <th>Area</th>
+      <th>Title</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="id"><a href="#H1">H1</a></td>
+      <td><span class="sev sev-HIGH">HIGH</span></td>
+      <td>udev / serial</td>
+      <td><code>/dev/r503</code> inherits permissive group + daemon does not <code>TIOCEXCL</code> the port</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#M1">M1</a></td>
+      <td><span class="sev sev-MEDIUM">MEDIUM</span></td>
+      <td>sensor.rs</td>
+      <td>Unbounded RX buffer in <code>read_line()</code> — OOM via a hostile sensor / co-opener</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#M2">M2</a></td>
+      <td><span class="sev sev-MEDIUM">MEDIUM</span></td>
+      <td>keystore.rs</td>
+      <td><code>load_key</code> follows symlinks and accepts any file mode</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#M3">M3</a></td>
+      <td><span class="sev sev-MEDIUM">MEDIUM</span></td>
+      <td>storage.rs / state.rs</td>
+      <td>JSON loaders accept unknown fields and don't enforce mode <code>0600</code></td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#M4">M4</a></td>
+      <td><span class="sev sev-MEDIUM">MEDIUM</span></td>
+      <td>firmware</td>
+      <td>Inner command body silently truncated to 96 bytes after MAC verify</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#M5">M5</a></td>
+      <td><span class="sev sev-MEDIUM">MEDIUM</span></td>
+      <td>dist/reseal-tpm.sh</td>
+      <td>Script relies on <code>PATH</code> for <code>arduino-cli</code> / <code>r503d</code> without hardening</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#L1">L1</a></td>
+      <td><span class="sev sev-LOW">LOW</span></td>
+      <td>dbus_iface.rs</td>
+      <td><code>verify_start</code> reads <code>user_slots</code> after dropping the state lock</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#L2">L2</a></td>
+      <td><span class="sev sev-LOW">LOW</span></td>
+      <td>framing.rs / crypto</td>
+      <td>MAC input formatted into heap <code>String</code> without <code>Zeroizing</code> wrapper</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#L3">L3</a></td>
+      <td><span class="sev sev-LOW">LOW</span></td>
+      <td>pairing.rs</td>
+      <td>allow-pair file existence check is a benign TOCTOU on a root-only directory</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#L4">L4</a></td>
+      <td><span class="sev sev-LOW">LOW</span></td>
+      <td>firmware</td>
+      <td>Input-buffer overflow gate uses <code>&gt; 128</code> instead of <code>&gt;= 128</code></td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#L5">L5</a></td>
+      <td><span class="sev sev-LOW">LOW</span></td>
+      <td>storage.rs</td>
+      <td>Username from <code>getpwuid_r</code> not validated against an allow-list</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#L6">L6</a></td>
+      <td><span class="sev sev-LOW">LOW</span></td>
+      <td>dbus_iface.rs</td>
+      <td>Polkit decision is not cached — repeated cross-user denials hammer polkit</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#L7">L7</a></td>
+      <td><span class="sev sev-LOW">LOW</span></td>
+      <td>dist/install.sh + uninstall.sh</td>
+      <td><code>net.reactivated.Fprint.service</code> overwrite is loud about co-tenancy with upstream fprintd</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#I1">I1</a></td>
+      <td><span class="sev sev-INFO">INFO</span></td>
+      <td>dbus_iface.rs</td>
+      <td>RECLASSIFIED — <code>DeleteEnrolledFingers</code> without claim is polkit-gated by design</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#I2">I2</a></td>
+      <td><span class="sev sev-INFO">INFO</span></td>
+      <td>tpm.rs</td>
+      <td>RECLASSIFIED — Owner hierarchy with empty auth does not bypass PolicyPCR seal</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#I3">I3</a></td>
+      <td><span class="sev sev-INFO">INFO</span></td>
+      <td>auth.rs</td>
+      <td>RECLASSIFIED — <code>Subject::new_for_owner(pid, None, None)</code> is the documented safe form</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#I4">I4</a></td>
+      <td><span class="sev sev-INFO">INFO</span></td>
+      <td>firmware</td>
+      <td>Confidence score is returned on the authenticated channel — not key-leaking</td>
+    </tr>
+    <tr>
+      <td class="id"><a href="#I5">I5</a></td>
+      <td><span class="sev sev-INFO">INFO</span></td>
+      <td>SPEC §13.11</td>
+      <td>Known &amp; documented limitations — single Nano, no <code>--resync</code>, no PCR-list audit</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="findings">Detailed Findings</h2>
+
+<!-- ============================== HIGH ============================== -->
+
+<section class="finding HIGH" id="H1">
+  <div class="head">
+    <span class="sev sev-HIGH">HIGH</span>
+    <h3>H1 — <code>/dev/r503</code> inherits permissive group + daemon does not <code>TIOCEXCL</code> the port</h3>
+    <span class="id-tag">UDEV-SERIAL-COMPETE</span>
+    <span class="path">pcside/daemon/dist/70-r503.rules · pcside/daemon/src/sensor.rs:94</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      The udev rules in <code>70-r503.rules</code> create a <code>/dev/r503</code> symlink with
+      <code>SYMLINK+="r503"</code> but never set <code>MODE=</code>, <code>OWNER=</code>, or
+      <code>GROUP=</code>. The resulting device permissions are inherited from the OS default for
+      <code>ttyACM*</code> / <code>ttyUSB*</code> — on Fedora and Ubuntu that is
+      <code>0660 root:dialout</code>. Any account in the <code>dialout</code> group can
+      <code>open(2)</code> the device and read/write bytes directly to the Nano.
+      Compounding this, <code>sensor.rs:94</code> opens the port with
+      <code>serialport::new(&amp;path, DEFAULT_BAUD).timeout(…).open()</code> with no exclusive
+      flag — the underlying <code>open(2)</code> does not pass <code>TIOCEXCL</code>, so the
+      daemon does <em>not</em> hold the port exclusively against a second opener.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      <strong>(a) Denial of service — paired Nano.</strong> A <code>dialout</code> user opens
+      <code>/dev/r503</code> and writes garbage bytes between the daemon's command and the Nano's
+      response. The daemon's read sees corrupted frames, fails MAC verify, surfaces
+      <code>framing_rejected</code> to PAM. fprintd retries; the attacker keeps writing.
+      Fingerprint auth is denied; PAM falls back to password — the user is annoyed, opens
+      KDE Settings, and finds no fault with the device. Persistent, low-noise DoS.
+      <br><br>
+      <strong>(b) Pair-race against a freshly wiped Nano.</strong> The
+      <code>reseal-tpm.sh</code> recovery flow (SPEC §13.12) reflashes the Nano with
+      <code>r503fp_wipe</code>, then reflashes the main firmware (briefly unpaired), then runs
+      <code>r503d --pair</code>. During the window between "main firmware booted" and "daemon
+      sends <code>pair &lt;hex&gt;</code>", an attacker watching <code>udev</code> events on
+      <code>/dev/r503</code> can write <code>pair &lt;attacker_hex&gt;\n</code> to the port
+      themselves. The firmware's <code>handlePair</code> (r503fp.ino:223) accepts the
+      attacker's key (it does not require a MAC in the unpaired state — TOFU bootstrap).
+      The legitimate daemon then attempts to pair, the Nano responds <code>ERR already_paired</code>,
+      <code>--pair</code> bails. The host's <code>/etc/r503d/allow-pair</code> gate guards the
+      <em>daemon's</em> pairing decision but does <em>not</em> guard the Nano's. The Nano now
+      holds an attacker-controlled key and the daemon has nothing matching it.
+      Outcome: persistent denial of fingerprint auth until manual reflash-and-pair from a
+      console session. <strong>This is not a privesc</strong> — the attacker can forge frames
+      the legitimate daemon refuses to talk to, but cannot make the daemon return
+      <code>match=N</code> for someone else's slot. Severity is therefore bounded at HIGH,
+      not CRITICAL.
+      <br><br>
+      <strong>(c) Side-channel observation.</strong> A passive opener can read all framed
+      traffic between daemon and Nano. The traffic is authenticated, not encrypted —
+      counter values and matched slot numbers are visible in cleartext. SPEC §13.1 explicitly
+      accepts that confidentiality is out of scope (templates never cross the wire), so this
+      bullet is informational, but worth flagging here so it's accounted for.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Two independent fixes, both cheap:
+      <ol>
+        <li>
+          Tighten <code>70-r503.rules</code> so the device the symlink points at is owned by
+          root with no group access. Add to every matching rule:
+          <code>OWNER="root" GROUP="root" MODE="0600"</code>. The <code>r503d.service</code>
+          unit already grants the daemon (running as root) <code>DeviceAllow=char-ttyACM rw</code>
+          + <code>char-ttyUSB rw</code>, so root-only DAC is sufficient.
+        </li>
+        <li>
+          Open the port exclusively in the daemon. The <code>serialport</code> crate exposes a
+          Unix-only <code>exclusive(true)</code> builder method backed by <code>TIOCEXCL</code>.
+          Add <code>.exclusive(true)</code> to the chain at <code>sensor.rs:94</code> and to
+          the <code>Link::open</code> path in <code>pairing.rs</code>. After
+          <code>TIOCEXCL</code> any second <code>open(2)</code> from a non-root user returns
+          <code>EBUSY</code>, which closes both the DoS angle and the pair-race even on hosts
+          with a more permissive distro default than the udev fix anticipated.
+        </li>
+      </ol>
+    </dd>
+  </dl>
+</section>
+
+<!-- ============================== MEDIUM ============================== -->
+
+<section class="finding MEDIUM" id="M1">
+  <div class="head">
+    <span class="sev sev-MEDIUM">MEDIUM</span>
+    <h3>M1 — Unbounded RX buffer in <code>read_line()</code></h3>
+    <span class="id-tag">SENSOR-UNBOUNDED-RXBUF</span>
+    <span class="path">pcside/daemon/src/sensor.rs:234–260</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      <code>R503::read_line()</code> grows <code>self.rx_buf</code> via
+      <code>extend_from_slice(&amp;buf[..n])</code> until it sees a <code>\n</code> or the
+      deadline expires. There is no hard cap on the line length. If the byte stream contains
+      no newline within the deadline, the buffer still keeps growing each loop iteration
+      (only the deadline check exits — not a length check). Combined with H1, a co-opener
+      can stream arbitrary bytes; alternatively a defective Nano (or a Nano in the middle of
+      a bootloader stuck state) can saturate memory.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      Local user in <code>dialout</code> opens <code>/dev/r503</code> and writes a long stream
+      of non-<code>\n</code> bytes faster than the daemon's deadline elapses. The daemon's
+      <code>rx_buf</code> grows past the 1024-byte initial capacity, allocating each time the
+      backing <code>Vec</code> doubles. Memory pressure spikes the daemon and, under
+      <code>MemoryDenyWriteExecute=true</code> + cgroup memory limits, can trigger OOM and
+      service restart. Repeated, this is a stealth DoS.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Add a constant — e.g. <code>const MAX_LINE_LEN: usize = 4096;</code> — and check
+      <code>self.rx_buf.len() &gt; MAX_LINE_LEN</code> on every iteration of the inner read
+      loop. On overflow, drop the buffer, flush the kernel input queue
+      (<code>self.port.clear(ClearBuffer::Input)</code>), and return
+      <code>SensorError::Protocol("line too long")</code>. 4 KiB is ~50× the spec frame size
+      (longest realistic framed line is ~120 bytes) and well below the firmware's
+      <code>inbuf &gt; 128</code> cap mirror.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding MEDIUM" id="M2">
+  <div class="head">
+    <span class="sev sev-MEDIUM">MEDIUM</span>
+    <h3>M2 — <code>load_key</code> follows symlinks and accepts any file mode</h3>
+    <span class="id-tag">KEYSTORE-NO-NOFOLLOW-NO-MODE-CHECK</span>
+    <span class="path">pcside/daemon/src/keystore.rs:54–66, 73–87</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      <code>keystore::load_key()</code> uses <code>fs::read_to_string(KEY_PATH)</code> which
+      follows symlinks via <code>open(2)</code> with no <code>O_NOFOLLOW</code>, and the loader
+      never inspects <code>fs::metadata(KEY_PATH).permissions().mode()</code> to verify the
+      live key is <code>0600</code> and the backup is <code>0400</code>. The key directory
+      <code>/var/lib/r503d</code> is created <code>0700 root</code>, so a non-root attacker
+      can't pre-stage a symlink there — but the protection is entirely "trust the directory
+      permissions" with zero belt-and-suspenders inside the load path.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      Two narrow but real paths:
+      <ol>
+        <li>
+          A compromised package post-install hook, an unrelated root-as-user service with a
+          path-traversal bug, or an installer race (the <code>install.sh</code> flow creates
+          the directory) can produce a symlink at <code>/var/lib/r503d/key</code> pointing at
+          <code>/etc/shadow</code>. The daemon reads the target file into a
+          <code>Zeroizing&lt;String&gt;</code>, fails <code>parse_key_hex</code>, but the file's
+          bytes have already passed through process memory. A subsequent crash producing a
+          coredump exposes the bytes.
+        </li>
+        <li>
+          A non-key-but-shaped-like-a-key file (32 hex chars) written by any process briefly
+          running as root with a write to <code>/var/lib/r503d/</code> can land at
+          <code>/var/lib/r503d/key.bak</code> with mode <code>0644</code>. The loader's
+          fallback path accepts it.
+        </li>
+      </ol>
+      Neither yields privesc on its own, but both undercut the assumption that an unsealed
+      plaintext key is only reachable by root.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Replace <code>fs::read_to_string(p)</code> with a guarded open: stat the path with
+      <code>fs::symlink_metadata</code> (does NOT follow symlinks), refuse if
+      <code>file_type().is_symlink()</code>, refuse if <code>uid != 0</code>, refuse if mode
+      &amp; <code>0o077</code> != 0 (i.e. any group/other access). Then open with
+      <code>OpenOptions::new().read(true).custom_flags(O_NOFOLLOW).open(p)</code> and read the
+      bytes. Mirror the same checks for <code>KEY_BAK_PATH</code> with a stricter
+      <code>0o177</code> mask.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding MEDIUM" id="M3">
+  <div class="head">
+    <span class="sev sev-MEDIUM">MEDIUM</span>
+    <h3>M3 — Persisted JSON files accept unknown fields and don't verify file mode</h3>
+    <span class="id-tag">JSON-LOOSE-LOAD</span>
+    <span class="path">pcside/daemon/src/storage.rs · state.rs</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      Both <code>StorageFile</code> (the on-disk container behind <code>users.json</code>) and
+      <code>State</code> (the counter file at <code>state.json</code>) deserialize with
+      <code>serde_json::from_slice</code> and the default <code>#[derive(Deserialize)]</code>
+      — meaning unknown fields are silently ignored and no schema-drift error is raised.
+      Neither loader checks the file's mode on load. Combined, the daemon accepts a
+      <code>users.json</code> with unknown keys (defense-in-depth break: a hostile root, or a
+      future buggy migration, could leave undetected drift in the file) and an attacker who
+      can briefly relax <code>users.json</code> to <code>0644</code> can read who is enrolled
+      and at which slot — useful for reconnaissance ahead of a templated-finger attack.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      Low-direct-impact, but the cost of <code>#[serde(deny_unknown_fields)]</code> is
+      negative (one annotation per struct) and the cost of a mode check is one
+      <code>fs::metadata().permissions().mode() == 0o600</code> branch. The status quo means
+      a stale or maliciously-modified file is silently accepted — which has bitten every
+      system that decided "we don't need <code>deny_unknown_fields</code> here" eventually.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Annotate the on-disk structs:
+<pre>#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageFile { … }
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct State { … }</pre>
+      And in both <code>load()</code> functions, before parsing, check the mode with
+      <code>let mode = fs::metadata(p)?.permissions().mode() &amp; 0o777; if mode != 0o600 { bail!("insecure mode {:o} on {p}", mode); }</code>.
+      Pair with the symlink check from M2.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding MEDIUM" id="M4">
+  <div class="head">
+    <span class="sev sev-MEDIUM">MEDIUM</span>
+    <h3>M4 — Firmware silently truncates the inner command body to 96 bytes after MAC verify</h3>
+    <span class="id-tag">FW-DISPATCH-TRUNCATION</span>
+    <span class="path">firmware/r503fp/r503fp.ino:331–336</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      After <code>verify_command_frame()</code> returns <code>FRAME_OK</code> with
+      <code>inner_len</code> &gt; <code>cap</code> (where <code>cap = 95</code>), the firmware
+      copies the first 95 bytes into <code>ibuf</code> and dispatches the truncated
+      command:
+<pre>char ibuf[96];
+size_t cap = sizeof(ibuf) - 1;
+size_t n = (inner_len &lt; cap) ? inner_len : cap;
+memcpy(ibuf, inner, n);
+ibuf[n] = 0;
+dispatch(String(ibuf));</pre>
+      The MAC has already been verified over the full <code>inner_len</code> bytes, so the
+      truncated form has no integrity gate. In the current command set the longest body is
+      ~10 bytes (<code>verify 199</code>), so this is far from any practical attacker craft,
+      but the silent failure mode means a future command added with a longer payload (e.g. a
+      <code>set-policy &lt;json&gt;</code> admin verb) could be exploitable on day one.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      Forward-looking. An attacker who controls the host (which is the
+      already-out-of-scope case for the current command set) crafts a long valid frame
+      whose MAC-verified prefix is one command and whose dropped suffix changes meaning
+      (e.g. <code>enroll 5 confirm</code> &rarr; <code>enroll 5</code>). For the
+      <em>current</em> firmware command set this is not exploitable, so the severity is
+      MEDIUM and not HIGH — but the codepath is the kind that ages badly.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Reject overlong inner bodies before dispatch instead of truncating. Add to
+      <code>process_line()</code> after the MAC + counter checks pass:
+<pre>if (inner_len &gt;= sizeof(ibuf)) {
+  Serial.println(F("ERR frame_body_too_long"));
+  return;
+}</pre>
+      The buffer size 96 is then a hard reject, not a silent truncation, and any future
+      command-set addition that needs more space must explicitly bump the buffer.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding MEDIUM" id="M5">
+  <div class="head">
+    <span class="sev sev-MEDIUM">MEDIUM</span>
+    <h3>M5 — <code>reseal-tpm.sh</code> resolves <code>arduino-cli</code> and <code>r503d</code> via <code>$PATH</code> with no hardening</h3>
+    <span class="id-tag">RESEAL-PATH-SOFT</span>
+    <span class="path">pcside/daemon/dist/reseal-tpm.sh</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      <code>reseal-tpm.sh</code> uses <code>command -v arduino-cli</code> and
+      <code>command -v r503d</code> to discover binaries (with a fallback to
+      <code>$SUDO_USER</code>'s home for the Arduino tooling). The script does
+      <code>set -euo pipefail</code> and is invoked as <code>sudo bash reseal-tpm.sh</code>,
+      so <code>sudo</code>'s default <code>secure_path</code> provides most of the protection
+      — but the script itself does not <code>export PATH=/usr/sbin:/usr/bin:/sbin:/bin</code>
+      at the top. A sudoers configuration with <code>env_keep += PATH</code> (more common than
+      it should be) gives any user able to run the script via sudo the ability to drop a
+      malicious <code>arduino-cli</code> in an early <code>$PATH</code> entry and have it
+      execute as root.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      An admin's sudoers rule grants <code>NOPASSWD: /usr/local/sbin/reseal-tpm.sh</code> to
+      the wheel group and leaves <code>env_keep+=PATH</code> intact. Attacker (wheel) runs
+      <code>PATH=/tmp/evil:$PATH sudo /usr/local/sbin/reseal-tpm.sh</code> with
+      <code>/tmp/evil/arduino-cli</code> chmod +x. Script executes the attacker's binary as
+      root. Privesc.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Pin <code>PATH</code> at the top of the script, before any function definitions:
+<pre>PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH</pre>
+      Optionally also use <code>/usr/bin/env -i</code> in the shebang or call out absolute
+      paths for the few external tools used (<code>systemctl</code>, <code>install</code>,
+      <code>arduino-cli</code>). The current shebang is <code>#!/usr/bin/env bash</code>,
+      which is fine, but combine it with the explicit <code>PATH</code> reset.
+    </dd>
+  </dl>
+</section>
+
+<!-- ============================== LOW ============================== -->
+
+<section class="finding LOW" id="L1">
+  <div class="head">
+    <span class="sev sev-LOW">LOW</span>
+    <h3>L1 — <code>verify_start</code> reads <code>user_slots</code> after dropping the state lock</h3>
+    <span class="id-tag">VERIFY-SLOT-RACE</span>
+    <span class="path">pcside/daemon/src/dbus_iface.rs:470–509</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      The action token is created inside a <code>state.lock()</code> scope at line 471–479,
+      then the lock is dropped, and <code>self.storage.get_user_slots(&amp;user)</code> is
+      called at line 485 to snapshot the expected slot set. Between those points, another
+      D-Bus call sharing the same claim could in principle race a mutation. In practice every
+      mutating method that touches the user's slots either (a) requires <code>ensure_claim</code>
+      to match the same sender (so cross-sender races are blocked at the gate), or (b) goes
+      through <code>delete_enrolled_fingers</code>, which is polkit-gated and denied by default.
+      Same-sender self-races are possible — the user can call
+      <code>DeleteEnrolledFinger</code> concurrently with their own
+      <code>VerifyStart</code> — but the worst case is that the verify naturally fails
+      (the template is gone from sensor flash too) without any privilege change.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      Bounded by <code>ensure_claim</code>. No realised privesc; included as a defense-in-depth
+      hygiene note.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Snapshot <code>user_slots</code> while still holding the state lock at line 471–479,
+      or hold a per-action read-lock on the user's slot set for the lifetime of the verify
+      task. The cleanest fix is to capture the slots before spawning the verify task and
+      pass the snapshot in by value, so the spawned task never re-reads storage.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding LOW" id="L2">
+  <div class="head">
+    <span class="sev sev-LOW">LOW</span>
+    <h3>L2 — MAC input formatted into heap <code>String</code> without <code>Zeroizing</code></h3>
+    <span class="id-tag">MAC-INPUT-NOT-ZEROIZED</span>
+    <span class="path">pcside/daemon/src/framing.rs:43, 65, 87, 119</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      Each MAC compute path allocates a <code>String</code> on the heap to hold the
+      domain-separated MAC input (<code>"CMD &lt;ctr&gt; &lt;cmd&gt;"</code> or
+      <code>"RSP &lt;ctr&gt; &lt;seq&gt; &lt;body&gt;"</code>) and lets it drop normally.
+      The buffer is not wrapped in <code>Zeroizing</code>; on drop the allocator may reuse
+      the slab and a heap-scanning attacker (or a future bug producing a coredump) can
+      observe recent MAC inputs. The inputs are not themselves secret — they contain only
+      command text, counter, seq, body — but the discipline of wrapping anything that
+      transits a key-derivation primitive in <code>Zeroizing</code> is what's missing.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      Negligible. The key itself is already in a <code>Zeroizing&lt;[u8;16]&gt;</code> and
+      the MAC input is public per the protocol. Worth fixing for consistency with the rest
+      of the codebase, not for direct exploitability.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Replace each <code>let mac_input = format!(…);</code> with
+      <code>let mut mac_input = Zeroizing::new(String::with_capacity(N));
+            use std::fmt::Write; write!(&amp;mut *mac_input, …)?;</code>
+      Or — slightly more idiomatic — build a stack <code>[u8; 256]</code> via
+      <code>arrayvec</code> and skip the heap entirely.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding LOW" id="L3">
+  <div class="head">
+    <span class="sev sev-LOW">LOW</span>
+    <h3>L3 — allow-pair gate is a benign TOCTOU on a root-only directory</h3>
+    <span class="id-tag">ALLOW-PAIR-TOCTOU</span>
+    <span class="path">pcside/daemon/src/pairing.rs:192–228</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      <code>run_pair</code> calls <code>keystore::allow_pair_present()</code> at line 192,
+      then continues to <code>generate_key</code> at line 219 and
+      <code>remove_allow_pair</code> at line 228. The check and the remove are not atomic,
+      and the file lives in <code>/etc/r503d/</code> which is root-owned. A non-root attacker
+      cannot influence the check. A root attacker can — but root is out of scope per the
+      threat model. Listing this for completeness because earlier auditors flagged it.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>None within the threat model.</dd>
+    <dt>Remediation</dt>
+    <dd>
+      None required. If you want a belt-and-suspenders fix anyway, move
+      <code>remove_allow_pair()</code> to immediately follow the check, then generate the key
+      — this would make the file removal a hard pre-commit rather than a tail action, and
+      cost nothing.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding LOW" id="L4">
+  <div class="head">
+    <span class="sev sev-LOW">LOW</span>
+    <h3>L4 — Input-buffer overflow gate is off-by-one</h3>
+    <span class="id-tag">FW-INBUF-OFF-BY-ONE</span>
+    <span class="path">firmware/r503fp/r503fp.ino:432</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      The firmware's per-line cap is implemented as
+      <code>if (inbuf.length() &gt; 128) { /* reject */ }</code>. This accepts a 129-byte
+      payload by the time the check fires (the 129th byte has already been appended to
+      <code>inbuf</code>). Because <code>inbuf</code> is a dynamic Arduino <code>String</code>,
+      there is no stack smash and no exploitable consequence — but the documented invariant
+      ("lines are capped at 128 bytes") is silently violated by one byte. Flag for hygiene.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>None.</dd>
+    <dt>Remediation</dt>
+    <dd>
+      Change to <code>&gt;= 128</code>, or define a named constant
+      <code>kInbufMax = 128</code> and check before append.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding LOW" id="L5">
+  <div class="head">
+    <span class="sev sev-LOW">LOW</span>
+    <h3>L5 — Username from <code>getpwuid_r</code> not validated against an allow-list</h3>
+    <span class="id-tag">USERNAME-NO-ALLOWLIST</span>
+    <span class="path">pcside/daemon/src/dbus_iface.rs:pwd_lookup</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      <code>pwd_lookup</code> returns the username string verbatim from
+      <code>getpwuid_r(3)</code>. Modern Linux <code>useradd</code> rejects usernames with
+      slashes, control chars, etc., but the daemon does not enforce its own allow-list.
+      A username containing path separators or control characters would survive the lookup
+      and become a HashMap key in <code>users.json</code>. Direct exploitability requires
+      a future code path that interpolates the username into a file path or a shell
+      argument — none exists today.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>
+      Forward-looking. No realised exploit on the current code surface.
+    </dd>
+    <dt>Remediation</dt>
+    <dd>
+      Add a one-line validator at the boundary in <code>auth::resolve_caller</code>:
+      reject usernames not matching <code>^[a-zA-Z_][a-zA-Z0-9._-]{0,31}$</code>.
+      Logs the rejected name and returns <code>FprintError::Internal</code>.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding LOW" id="L6">
+  <div class="head">
+    <span class="sev sev-LOW">LOW</span>
+    <h3>L6 — Polkit decision is not cached</h3>
+    <span class="id-tag">POLKIT-NO-CACHE</span>
+    <span class="path">pcside/daemon/src/auth.rs:81–101</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      Every cross-user request (i.e. every call where the requested username differs from
+      the caller and the caller isn't uid 0) makes a fresh
+      <code>check_authorization</code> RPC to polkitd. There is no per-caller cache of the
+      result. A wheel-group user issuing rapid <code>Claim "victim"</code> calls produces a
+      <code>1:1</code> RPC fan-out to polkit. Not a privesc, but a tiny amplification factor
+      that could contribute to a polkit-side DoS if the system is already stressed.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>Negligible on a workstation; modestly useful as part of a wider DoS chain.</dd>
+    <dt>Remediation</dt>
+    <dd>
+      Optional. If implemented: a small <code>Mutex&lt;HashMap&lt;(u32, &amp;'static str), (Instant, bool)&gt;&gt;</code>
+      keyed on <code>(caller_pid, action_id)</code> with a 1-second TTL would be sufficient.
+      The current behavior (always-fresh polkit) is the safer default and the perf hit is
+      not measurable on real workloads — leave it unless monitoring flags it.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding LOW" id="L7">
+  <div class="head">
+    <span class="sev sev-LOW">LOW</span>
+    <h3>L7 — <code>install.sh</code> co-tenants with upstream <code>fprintd</code></h3>
+    <span class="id-tag">INSTALL-COEXIST-NOISE</span>
+    <span class="path">pcside/daemon/dist/install.sh</span>
+  </div>
+  <dl>
+    <dt>Description</dt>
+    <dd>
+      The install script overwrites <code>/usr/share/dbus-1/system-services/net.reactivated.Fprint.service</code>
+      and the matching D-Bus policy file — both upstream fprintd paths. If both packages are
+      installed, the last one wins and the loser silently breaks. Mitigation in the systemd
+      unit is <code>Conflicts=fprintd.service</code> (good), but the .service / .conf
+      replacement on disk is irreversible by the uninstall script (which removes our files,
+      leaving fprintd without its own). This is operational, not security — but a
+      user-confused-by-bricked-fprintd may reach for "fix it fast" tactics that re-open
+      attack surface.
+    </dd>
+    <dt>Attack Vector</dt>
+    <dd>None within the threat model.</dd>
+    <dt>Remediation</dt>
+    <dd>
+      Make <code>install.sh</code> back up the upstream files before overwrite
+      (<code>mv -n /usr/share/dbus-1/system-services/net.reactivated.Fprint.service{,.fprintd.bak}</code>)
+      and have <code>uninstall.sh</code> restore them if present.
+    </dd>
+  </dl>
+</section>
+
+<!-- ============================== INFO / RECLASSIFIED ============================== -->
+
+<h3 style="margin-top:36px;">Reclassified Findings (originally flagged higher, downgraded after re-verification)</h3>
+
+<section class="finding INFO" id="I1">
+  <div class="head">
+    <span class="sev sev-INFO">INFO</span>
+    <h3>I1 — RECLASSIFIED — <code>DeleteEnrolledFingers</code> without claim is polkit-gated by design</h3>
+    <span class="id-tag">DEL-NO-CLAIM-BY-DESIGN</span>
+    <span class="path">pcside/daemon/src/dbus_iface.rs:335–348</span>
+  </div>
+  <dl>
+    <dt>Note</dt>
+    <dd>
+      An auditor flagged the legacy <code>DeleteEnrolledFingers(username)</code> method as a
+      CRITICAL privesc because it does not call <code>ensure_claim</code>. Direct re-read of
+      lines 335–348 confirms it calls <code>auth::authorize_username</code>, which routes
+      cross-user requests through polkit's <code>net.reactivated.fprint.device.setusername</code>
+      action. The shipped polkit policy denies that action by default for every session class
+      (<code>allow_any=no</code>, <code>allow_inactive=no</code>, <code>allow_active=no</code>),
+      and the comment at lines 341–344 explicitly explains the design choice — fprintd parity
+      via polkit, with a claim-gated <code>DeleteEnrolledFingers2</code> alongside for tighter
+      flows. Severity is INFO; no action recommended.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding INFO" id="I2">
+  <div class="head">
+    <span class="sev sev-INFO">INFO</span>
+    <h3>I2 — RECLASSIFIED — Owner hierarchy with empty auth does not bypass the PCR seal</h3>
+    <span class="id-tag">TPM-OWNER-NO-BYPASS</span>
+    <span class="path">pcside/daemon/src/tpm.rs</span>
+  </div>
+  <dl>
+    <dt>Note</dt>
+    <dd>
+      An auditor flagged the use of <code>Hierarchy::Owner</code> with an unset Owner auth
+      value as a path that bypasses the PCR policy. This is incorrect. The sealed object is
+      created with <code>userWithAuth = false</code> and <code>adminWithPolicy = true</code>,
+      and the unseal path supplies a <code>PolicyPCR</code> session — TPM2_Unseal will fail
+      unless the session's digest matches the policy baked into the object at seal time.
+      The Owner hierarchy's auth governs the parent key's lifecycle (create / evict), not the
+      sealed child's unseal authorization. The seal stands regardless of Owner-auth setting.
+      No action needed.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding INFO" id="I3">
+  <div class="head">
+    <span class="sev sev-INFO">INFO</span>
+    <h3>I3 — RECLASSIFIED — <code>Subject::new_for_owner(pid, None, None)</code> is the safe form</h3>
+    <span class="id-tag">POLKIT-START-TIME-SAFE</span>
+    <span class="path">pcside/daemon/src/auth.rs:89</span>
+  </div>
+  <dl>
+    <dt>Note</dt>
+    <dd>
+      An auditor speculated that passing <code>None</code> for the unix-process start_time to
+      <code>zbus_polkit::Subject::new_for_owner</code> would let polkitd authorize on
+      <code>pid</code> alone and be vulnerable to pid reuse. In practice polkitd
+      <em>itself</em> reads <code>start_time</code> from <code>/proc/&lt;pid&gt;/stat</code>
+      on receipt of the call when the caller didn't supply one, so the
+      <code>(pid, start_time)</code> tuple is bound on the polkit side. The comment at
+      <code>auth.rs:84–88</code> documents this. INFO only; no change.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding INFO" id="I4">
+  <div class="head">
+    <span class="sev sev-INFO">INFO</span>
+    <h3>I4 — Confidence score on the authenticated channel does not leak key material</h3>
+    <span class="id-tag">FW-CONFIDENCE-OK</span>
+    <span class="path">firmware/r503fp/r503fp.ino:168–187</span>
+  </div>
+  <dl>
+    <dt>Note</dt>
+    <dd>
+      The R503's per-match confidence score is returned in the framed
+      <code>OK match=N confidence=M</code> response. It correlates with finger image clarity
+      (texture, pressure, area), not with the SipHash key. SPEC §13.1 acknowledges that
+      confidentiality is out of scope. No issue.
+    </dd>
+  </dl>
+</section>
+
+<section class="finding INFO" id="I5">
+  <div class="head">
+    <span class="sev sev-INFO">INFO</span>
+    <h3>I5 — Acknowledged limitations from SPEC §13.11</h3>
+    <span class="id-tag">SPEC-KNOWN-LIMITS</span>
+    <span class="path">SPEC.md §13.11</span>
+  </div>
+  <dl>
+    <dt>Note</dt>
+    <dd>
+      Several items the user might expect to see flagged are already documented as known
+      limitations: single Nano = single point of failure; no <code>r503d --resync</code>;
+      no <code>degraded=true</code> banner for all-CRC-fail EEPROM; no paid third-party
+      crypto audit; TPM-seal is opt-in not default; CH340-based clones share VID/PID;
+      no firmware-side fuzz harness. These are listed here so a reader cross-checking the
+      audit against the spec doesn't mistake them for missed findings.
+    </dd>
+  </dl>
+</section>
+
+<!-- ============================== WHAT IS SOLID ============================== -->
+
+<h2>What's Solid</h2>
+
+<p>
+  The codebase has clear defensive design and the hardening commits (S1–S9 + TPM-seal +
+  crypto-posture) show up in the right places. Specifically:
+</p>
+
+<div class="callout ok">
+  <h4>Authentication of the wire protocol</h4>
+  <p>
+    SipHash-2-4 implementation matches Aumasson reference vectors on both sides; the firmware
+    runs a boot-time KAT self-test (<code>r503fp.ino:361–392</code>) that halts the framed
+    channel if the primitive diverges; the host-side cross-validates against the third-party
+    <code>siphasher</code> crate over 1024 random inputs. MAC comparison is constant-time on
+    both sides (<code>subtle::ConstantTimeEq</code> on Rust, unconditional XOR-OR accumulator
+    on AVR). Domain separation between CMD and RSP MAC inputs is enforced and verified by
+    tests. Counter persistence ordering is correct (persist before send on host, persist
+    before handler on firmware) — both designed to survive a crash without enabling replay.
+  </p>
+</div>
+
+<div class="callout ok">
+  <h4>Caller authorization</h4>
+  <p>
+    <code>auth::authorize_username</code> is the single chokepoint for every
+    <code>username</code>-accepting D-Bus method. Empty-string &rarr; caller, self-request
+    fast path, uid 0 (PAM) fast path, cross-user via polkit with no
+    <code>AllowUserInteraction</code> (so an SSH attacker can't pop a dialog on the active
+    session). The shipped polkit policy defaults every session class to <code>no</code>,
+    so the cross-user gate is closed unless an admin explicitly grants it via
+    <code>/etc/polkit-1/rules.d/</code>. The D-Bus policy is deny-by-default with explicit
+    allows for wheel + root only on the specific interfaces — stricter than upstream fprintd.
+  </p>
+</div>
+
+<div class="callout ok">
+  <h4>Systemd confinement</h4>
+  <p>
+    <code>r503d.service</code> applies a wide hardening set:
+    <code>ProtectSystem=strict</code>, <code>ProtectHome=true</code>,
+    <code>PrivateTmp=true</code>, <code>PrivateNetwork=true</code>,
+    <code>NoNewPrivileges=true</code>, <code>RestrictAddressFamilies=AF_UNIX</code>,
+    <code>SystemCallFilter=@system-service</code>, <code>MemoryDenyWriteExecute=true</code>,
+    <code>LockPersonality=true</code>, <code>RestrictNamespaces=true</code>,
+    <code>RestrictSUIDSGID=true</code>, <code>CapabilityBoundingSet=</code> (empty),
+    <code>DevicePolicy=closed</code> + explicit <code>DeviceAllow</code> for
+    <code>char-ttyACM</code> / <code>char-ttyUSB</code> / <code>/dev/tpmrm0</code>,
+    <code>ProtectClock=true</code>, <code>ProtectHostname=true</code>,
+    <code>ProtectKernelLogs=true</code>, <code>ProtectKernelTunables=true</code>,
+    <code>ProtectKernelModules=true</code>, <code>ProtectControlGroups=true</code>.
+    A successful exploit of <code>r503d</code> would land in a process that can do almost
+    nothing other than touch <code>/var/lib/r503d</code> and the serial char device.
+  </p>
+</div>
+
+<div class="callout ok">
+  <h4>Key handling</h4>
+  <p>
+    The 128-bit key is wrapped in <code>Zeroizing&lt;[u8;16]&gt;</code> from generation
+    (<code>getrandom::fill</code>) through use and into save. Hex form is also
+    <code>Zeroizing&lt;String&gt;</code>. Plaintext files are written atomically
+    (<code>tmp + fsync + rename</code>) at <code>0600</code> / <code>0400</code>, and
+    deletion shreds with 0xFF before unlink. TPM seal binds to PCR7 by default, with
+    operator-selectable extra PCRs; on a PCR mismatch the daemon refuses to start rather
+    than falling back to plaintext, and the reseal ceremony preserves enrolled templates.
+    No plaintext-key fallback exists when a sealed blob is present — that path is removed
+    so it can't be coerced by an attacker who manages to delete the sealed file.
+  </p>
+</div>
+
+<div class="callout ok">
+  <h4>Replay defence</h4>
+  <p>
+    Wear-leveled EEPROM counter ring (16 cells × CRC-16-CCITT) holds the Nano's
+    <code>last_seen</code> across reboots; host's <code>next_cmd_counter</code> is
+    persisted atomically before each send. Pairing is TOFU with an explicit host-side
+    opt-in (<code>/etc/r503d/allow-pair</code>) so an attacker plugging in a hostile Nano
+    cannot auto-pair. The unpair path is framed (proves key knowledge); the wipe-and-reflash
+    path is the documented recovery for lost-key scenarios.
+  </p>
+</div>
+
+<h2>Recommendations &mdash; Prioritised</h2>
+
+<ol class="tight">
+  <li><strong>Now (H1):</strong> add <code>MODE="0600" OWNER="root" GROUP="root"</code> to every matching rule in <code>70-r503.rules</code>, and add <code>.exclusive(true)</code> to the <code>serialport</code> open call in <code>sensor.rs</code> and the pairing <code>Link::open</code>.</li>
+  <li><strong>Next (M1, M5):</strong> bound <code>rx_buf</code> length in <code>read_line()</code>; pin <code>PATH</code> at the top of <code>reseal-tpm.sh</code>.</li>
+  <li><strong>Soon (M2, M3, M4):</strong> add <code>O_NOFOLLOW</code> + mode-verify on key + state JSON loads; add <code>#[serde(deny_unknown_fields)]</code>; replace firmware <code>memcpy</code>-then-truncate with a reject path.</li>
+  <li><strong>Hygiene (L*, I*):</strong> rest of the low / informational items.</li>
+</ol>
+
+<h2>Conclusion</h2>
+
+<p>
+  The r503-fpr stack does what a hobbyist security-conscious project rarely does: it has
+  an explicit threat model, hardening that addresses that model layer by layer, and tests
+  (KAT, fuzz, cross-impl, end-to-end PAM regression) that prove the hardening still works
+  after each refactor. No critical privilege-escalation paths exist within the documented
+  threat model and the security boundaries hold against the audit's stretch goals (wheel
+  user / dialout user / passive observer on the wire).
+</p>
+<p>
+  The single HIGH finding is the implicit one: the daemon assumes it has exclusive access
+  to <code>/dev/r503</code> by virtue of the udev rule, but the udev rule never makes that
+  assumption true and the daemon's open call doesn't enforce it. Two ~5-line changes close
+  it. The remaining findings are defense-in-depth polish that bring the codebase to a posture
+  consistent with the seriousness of its threat model documentation.
+</p>
+
+<footer>
+  Audit generated by adversarial multi-agent sweep + manual verification on 2026-05-28.
+  Repository: <code>github.com/matpb/linux-fingerprint-r503</code> · HEAD <code>10a991c</code> on <code>main</code>.
+  Methodology: six parallel auditor subagents on disjoint slices, returns re-verified
+  against source. All claimed CRITICAL / HIGH findings from subagents survived re-verification
+  or were explicitly downgraded with reason. Threat model excludes physical access and
+  pre-existing root per the requesting brief.
+</footer>
+
+</div>
+</body>
+</html>

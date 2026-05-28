@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -19,6 +19,9 @@ pub const STATE_DIR: &str = "/var/lib/r503d";
 pub const STATE_PATH: &str = "/var/lib/r503d/state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// deny_unknown_fields: a stale/garbled/maliciously-edited state.json with extra
+// keys is rejected loudly rather than silently parsed (audit 2026-05-28 / M3).
+#[serde(deny_unknown_fields)]
 pub struct State {
     /// Counter value to use on the NEXT framed command.
     pub next_cmd_counter: u64,
@@ -38,6 +41,17 @@ pub fn load() -> Result<Option<State>> {
     let path = Path::new(STATE_PATH);
     if !path.exists() {
         return Ok(None);
+    }
+    // Refuse a state file that's readable/writable by anyone but root. save()
+    // always writes 0600; anything looser means the file was tampered with or
+    // left behind by a buggy migration (audit 2026-05-28 / M3).
+    let mode = fs::metadata(STATE_PATH)
+        .with_context(|| format!("stat {}", STATE_PATH))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        bail!("insecure mode {:o} on {} (expected 0600)", mode, STATE_PATH);
     }
     let bytes = fs::read(STATE_PATH)
         .with_context(|| format!("reading {}", STATE_PATH))?;
