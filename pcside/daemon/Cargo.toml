@@ -29,6 +29,21 @@ anyhow = "1"
 libc = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tss-esapi = "7.7.0"
+# Crypto-posture hardening (SPEC §13 review pass, 2026-05-28).
+# subtle: formally constant-time MAC compare (replaces hand-rolled XOR + branch).
+# zeroize: scrub key bytes from RAM/swap on drop.
+# getrandom: SPEC §13.2 names getrandom(2) for key generation; use the wrapper
+#   so the syscall is invoked directly (blocks until kernel pool is seeded).
+# rpassword: optional TPM-seal PIN prompt (SPEC §13.12 follow-up).
+subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+getrandom = "0.3"
+rpassword = "7"
+
+[dev-dependencies]
+# Independent third-party SipHash implementation, cross-validated against the
+# in-tree hand-rolled crypto.rs to make divergence loud in CI (SPEC §13 review).
+siphasher = "1"
 
 [profile.release]
 opt-level = 3

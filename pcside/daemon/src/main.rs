@@ -62,11 +62,20 @@ struct Args {
     #[arg(long, conflicts_with_all = ["unpair", "status", "reseal_tpm"])]
     pair: bool,
 
-    /// With --pair: seal the generated key to the TPM (PCR7). Replaces the
-    /// plaintext key.bak fallback with key.tpm (SPEC §13.12). On a host
-    /// without a TPM2 device, --pair without this flag stays the default.
+    /// With --pair: seal the generated key to the TPM (default PCR7).
+    /// Replaces the plaintext key.bak fallback with key.tpm (SPEC §13.12).
+    /// On a host without a TPM2 device, --pair without this flag stays the
+    /// default.
     #[arg(long, requires = "pair")]
     seal_tpm: bool,
+
+    /// With --pair --seal-tpm OR --reseal-tpm: comma-separated PCR list to
+    /// bind the seal to (default `7`). Examples: `7,11` (Secure Boot + UKI
+    /// kernel/initrd hash), `0,4,7` (firmware + bootloader + Secure Boot).
+    /// Each extra PCR tightens the seal but invalidates it on the
+    /// corresponding update event (PCR11 → kernel bump → reseal). SPEC §13.12.
+    #[arg(long)]
+    seal_tpm_pcrs: Option<String>,
 
     /// One-shot: wipe pairing from the Nano + host (key rotation / decommission).
     #[arg(long, conflicts_with_all = ["pair", "status", "reseal_tpm"])]
@@ -114,13 +123,23 @@ async fn main() -> anyhow::Result<()> {
         return pairing::run_status(args.port.as_deref());
     }
     if args.pair {
-        return pairing::run_pair(args.port.as_deref(), args.seal_tpm);
+        if args.seal_tpm_pcrs.is_some() && !args.seal_tpm {
+            anyhow::bail!("--seal-tpm-pcrs requires --seal-tpm (or use --reseal-tpm)");
+        }
+        return pairing::run_pair(
+            args.port.as_deref(),
+            args.seal_tpm,
+            args.seal_tpm_pcrs.as_deref(),
+        );
     }
     if args.unpair {
         return pairing::run_unpair(args.port.as_deref());
     }
     if args.reseal_tpm {
-        return pairing::run_reseal_tpm(args.port.as_deref());
+        return pairing::run_reseal_tpm(
+            args.port.as_deref(),
+            args.seal_tpm_pcrs.as_deref(),
+        );
     }
 
     let storage_path = args

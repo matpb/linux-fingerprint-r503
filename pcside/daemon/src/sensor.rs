@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 use crate::framing;
 use crate::state;
@@ -71,7 +72,10 @@ pub struct R503 {
     // execute() wraps the outgoing command in `C <ctr> ... M <mac>` framing
     // and verifies the corresponding `R <ctr> <seq> ... M <mac>` responses.
     // When None, execute() falls back to the v1 plain-ASCII protocol.
-    key: Option<[u8; 16]>,
+    //
+    // `Zeroizing<...>` so the key bytes are scrubbed from RAM on drop / unset
+    // (crypto-posture review item #2 — closes the RAM/swap/core-dump leak).
+    key: Option<Zeroizing<[u8; 16]>>,
     /// Counter to use on the NEXT framed command. Persisted to state::STATE_PATH
     /// BEFORE each send so a crash never lets us reuse a counter.
     client_counter: u64,
@@ -109,7 +113,7 @@ impl R503 {
     /// Engage the v2 authenticated channel. `next_counter` is the value to
     /// use on the first framed command — typically loaded from `state.json`
     /// (or `state::State::fresh().next_cmd_counter` for a brand-new pairing).
-    pub fn set_auth(&mut self, key: [u8; 16], next_counter: u64) {
+    pub fn set_auth(&mut self, key: Zeroizing<[u8; 16]>, next_counter: u64) {
         self.key = Some(key);
         self.client_counter = next_counter;
     }
@@ -310,7 +314,15 @@ impl R503 {
     /// sending (so a crash never lets us reuse a counter — SPEC §13.4), and
     /// verify every incoming response frame against the same counter.
     fn execute_framed(&mut self, cmd: &str, timeout_ms: u64) -> Result<String, SensorError> {
-        let key = self.key.expect("execute_framed called without key");
+        // Clone into a local `Zeroizing<[u8; 16]>` — borrowing from `self.key`
+        // would block the mutable `&mut self` borrows used by `read_line` /
+        // `port.write_all` below. The local copy scrubs on drop at the end
+        // of execute_framed.
+        let key: Zeroizing<[u8; 16]> = self
+            .key
+            .as_ref()
+            .expect("execute_framed called without key")
+            .clone();
         let counter = self.client_counter;
 
         // Persist next BEFORE sending. Crash here ⇒ daemon restart sees the

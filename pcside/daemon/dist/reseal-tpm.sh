@@ -19,6 +19,33 @@
 
 set -euo pipefail
 
+# --pcrs <list>  optional PCR list (default 7). Passed through to
+#                r503d --reseal-tpm. Use 7,11 to additionally bind UKI
+#                (kernel+initrd) measurement, etc. SPEC §13.12.
+PCRS=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pcrs)
+            PCRS="$2"
+            shift 2
+            ;;
+        --pcrs=*)
+            PCRS="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,18p' "$0" | sed 's/^# *//'
+            echo
+            echo "Usage: sudo bash $0 [--pcrs <list>]"
+            exit 0
+            ;;
+        *)
+            echo "unknown arg: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
 if [[ $EUID -ne 0 ]]; then
     echo "must be run as root: sudo bash $0" >&2
     exit 1
@@ -107,8 +134,13 @@ if ! command -v r503d >/dev/null 2>&1; then
     exit 1
 fi
 
-echo ">>> [5/7] running r503d --reseal-tpm (generates new key, seals to PCR7)"
-r503d --reseal-tpm --port "$PORT"
+if [[ -n "$PCRS" ]]; then
+    echo ">>> [5/7] running r503d --reseal-tpm --seal-tpm-pcrs $PCRS"
+    r503d --reseal-tpm --port "$PORT" --seal-tpm-pcrs "$PCRS"
+else
+    echo ">>> [5/7] running r503d --reseal-tpm (generates new key, seals to PCR7)"
+    r503d --reseal-tpm --port "$PORT"
+fi
 
 echo ">>> [6/7] starting r503d.service"
 systemctl start r503d.service

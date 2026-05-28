@@ -14,9 +14,10 @@
 
 use anyhow::{bail, Context, Result};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
+use zeroize::Zeroizing;
 
 pub const KEY_DIR: &str = "/var/lib/r503d";
 pub const KEY_PATH: &str = "/var/lib/r503d/key";
@@ -50,10 +51,13 @@ pub fn remove_allow_pair() -> Result<()> {
     }
 }
 
-pub fn load_key() -> Option<[u8; 16]> {
+pub fn load_key() -> Option<Zeroizing<[u8; 16]>> {
     for p in [KEY_PATH, KEY_BAK_PATH] {
         if let Ok(s) = fs::read_to_string(p) {
-            if let Ok(k) = parse_key_hex(s.trim()) {
+            // Wrap the hex form too — it's just as sensitive as the bytes
+            // and lives on the heap until the trim()'d slice is parsed.
+            let hex = Zeroizing::new(s);
+            if let Ok(k) = parse_key_hex(hex.trim()) {
                 return Some(k);
             }
         }
@@ -66,7 +70,7 @@ pub fn load_key() -> Option<[u8; 16]> {
 /// function either returns the unsealed key or errors — it will not silently
 /// fall back to plaintext (which would defeat the seal). The caller is
 /// expected to surface the error and refuse to start.
-pub fn load_key_with_source() -> Result<Option<([u8; 16], KeySource)>> {
+pub fn load_key_with_source() -> Result<Option<(Zeroizing<[u8; 16]>, KeySource)>> {
     if Path::new(KEY_TPM_PATH).exists() {
         let blob = fs::read(KEY_TPM_PATH)
             .with_context(|| format!("reading sealed key blob at {}", KEY_TPM_PATH))?;
@@ -116,9 +120,37 @@ pub fn save_key(key: &[u8; 16]) -> Result<()> {
     Ok(())
 }
 
-/// Remove both plaintext key files. Idempotent — missing files are not an error.
+/// Overwrite the existing file's bytes with 0xFF before unlinking. On
+/// classic block filesystems this rewrites the same disk blocks; on
+/// copy-on-write filesystems (btrfs, zfs) and SSDs with TRIM the prior
+/// extents may persist until reused — full guarantees need at-rest
+/// encryption (LUKS) underneath. This is hygiene, not absolute erasure.
+fn shred_file(path: &str) -> std::io::Result<()> {
+    // 33 = 32 hex chars + newline. Match the on-disk layout so block
+    // boundaries line up on the fs side.
+    let zap = [0xFFu8; 33];
+    match fs::OpenOptions::new().write(true).truncate(false).open(path) {
+        Ok(mut f) => {
+            f.write_all(&zap)?;
+            f.sync_all()?;
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove both plaintext key files. Idempotent — missing files are not an
+/// error. Shreds contents (0xFF-overwrite + fsync) before unlink as a
+/// best-effort defense against post-delete recovery from raw disk reads.
 pub fn delete_key() -> Result<()> {
     for p in [KEY_PATH, KEY_BAK_PATH] {
+        // KEY_BAK is 0400 — flip to writable before shred, otherwise the
+        // overwrite fails with EACCES.
+        fs::set_permissions(p, fs::Permissions::from_mode(0o600)).ok();
+        if let Err(e) = shred_file(p) {
+            tracing::warn!(path = p, error = %e, "shred_file failed; continuing to unlink");
+        }
         match fs::remove_file(p) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -128,10 +160,19 @@ pub fn delete_key() -> Result<()> {
     Ok(())
 }
 
-/// Seal the key to PCR7 and write `KEY_TPM_PATH` atomically. Deletes any
-/// plaintext key copies on success — keeping them would defeat the seal.
+/// Seal the key to PCR7 (default) and write `KEY_TPM_PATH` atomically.
+/// Equivalent to `save_key_sealed_with_pcrs(key, &[7])`.
 pub fn save_key_sealed(key: &[u8; 16]) -> Result<()> {
-    let blob = crate::tpm::seal_key(key).context("sealing key to TPM (PCR7)")?;
+    save_key_sealed_with_pcrs(key, &[7])
+}
+
+/// Seal the key to a caller-chosen PCR set and write `KEY_TPM_PATH`
+/// atomically. Deletes any plaintext key copies on success — keeping them
+/// would defeat the seal. The PCR set is encoded into the sealed blob so the
+/// unseal path uses the same policy automatically (see `tpm::deserialize_blob`).
+pub fn save_key_sealed_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<()> {
+    let blob = crate::tpm::seal_key_with_pcrs(key, pcrs)
+        .with_context(|| format!("sealing key to TPM (PCRs {:?})", pcrs))?;
 
     fs::create_dir_all(KEY_DIR).with_context(|| format!("creating {}", KEY_DIR))?;
     fs::set_permissions(KEY_DIR, fs::Permissions::from_mode(0o700)).ok();
@@ -174,26 +215,31 @@ pub fn delete_all_keys() -> Result<()> {
     Ok(())
 }
 
-pub fn generate_key() -> Result<[u8; 16]> {
-    let mut key = [0u8; 16];
-    let mut f = fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
-    f.read_exact(&mut key).context("reading /dev/urandom")?;
+/// Generate a fresh 128-bit key via the `getrandom(2)` syscall (SPEC §13.2).
+/// `getrandom` blocks until the kernel CSPRNG pool is seeded; the resulting
+/// bytes are wrapped in `Zeroizing` so they scrub on drop.
+pub fn generate_key() -> Result<Zeroizing<[u8; 16]>> {
+    let mut key = Zeroizing::new([0u8; 16]);
+    getrandom::fill(&mut *key)
+        .map_err(|e| anyhow::anyhow!("getrandom(2) failed: {e}"))?;
     Ok(key)
 }
 
-pub fn key_hex(key: &[u8; 16]) -> String {
+/// Hex form of the key. Returned `Zeroizing<String>` scrubs the heap-allocated
+/// buffer on drop so a `String::clone` floating around can't outlive use.
+pub fn key_hex(key: &[u8; 16]) -> Zeroizing<String> {
     let mut s = String::with_capacity(32);
     for b in key {
         s.push_str(&format!("{:02x}", b));
     }
-    s
+    Zeroizing::new(s)
 }
 
-pub fn parse_key_hex(s: &str) -> Result<[u8; 16]> {
+pub fn parse_key_hex(s: &str) -> Result<Zeroizing<[u8; 16]>> {
     if s.len() != 32 {
         bail!("key must be 32 hex chars, got {}", s.len());
     }
-    let mut out = [0u8; 16];
+    let mut out = Zeroizing::new([0u8; 16]);
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
         let hi = nybble(chunk[0])?;
         let lo = nybble(chunk[1])?;
@@ -220,7 +266,7 @@ mod tests {
         let k: [u8; 16] = std::array::from_fn(|i| i as u8 * 17);
         let h = key_hex(&k);
         let back = parse_key_hex(&h).unwrap();
-        assert_eq!(k, back);
+        assert_eq!(k, *back);
     }
 
     #[test]
@@ -229,7 +275,7 @@ mod tests {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
             0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
         ];
-        assert_eq!(key_hex(&k), "000102030405060708090a0b0c0d0e0f");
+        assert_eq!(&*key_hex(&k), "000102030405060708090a0b0c0d0e0f");
     }
 
     #[test]

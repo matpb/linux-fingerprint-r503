@@ -37,9 +37,9 @@ fn main() -> Result<()> {
     let t1 = Instant::now();
     let recovered = tpm::unseal_key(&blob)?;
     let unseal_ms = t1.elapsed().as_millis();
-    println!("unsealed:       {} (in {} ms)", hex16(&recovered), unseal_ms);
+    println!("unsealed:       {} (in {} ms)", hex16(&*recovered), unseal_ms);
 
-    if recovered != key {
+    if *recovered != key {
         anyhow::bail!("round-trip mismatch");
     }
     println!("OK: round-trip succeeded");

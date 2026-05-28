@@ -1,0 +1,83 @@
+name: CI
+
+# Crypto-posture review item #12 + #14 — every PR must pass:
+#  - cargo test (unit + lib + cross-impl SipHash + framing fuzz smoke)
+#  - cargo audit (RustSec advisory database check)
+#  - firmware compiles for atmega328 (catches header / API regressions)
+#
+# The `cargo fuzz` long-corpus runs are NOT wired into this stable-CI flow
+# because libFuzzer requires nightly Rust. Maintainers with a nightly
+# toolchain can `cargo +nightly fuzz run framing -- -max_total_time=3600`
+# locally; the stable property fuzzer in tests/fuzz_framing_smoke.rs runs
+# ~135 000 inputs per PR with the same no-panic invariant.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  daemon-test:
+    name: cargo test (daemon)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pcside/daemon
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup update stable && rustup default stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pcside/daemon/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('pcside/daemon/Cargo.lock') }}
+      - name: Install build deps (tpm2-tss for tss-esapi linkage)
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: cargo build
+        run: cargo build --all-targets --locked
+      - name: cargo test (unit + lib + integration)
+        run: cargo test --locked
+      - name: cargo test --release fuzz_framing_smoke (more cycles in release)
+        run: cargo test --release --test fuzz_framing_smoke --locked
+
+  daemon-audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pcside/daemon
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup update stable && rustup default stable
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: cargo audit
+        # Fails the build on any unallowed advisory. Allow-list (if needed)
+        # lives in pcside/daemon/audit.toml.
+        run: cargo audit --deny warnings
+
+  firmware-build:
+    name: arduino-cli compile (r503fp + r503fp_wipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+            | BINDIR=$HOME/.local/bin sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - name: Configure arduino-cli (AVR core + Adafruit_Fingerprint lib)
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+          arduino-cli lib install "Adafruit Fingerprint Sensor Library"
+      - name: Compile firmware/r503fp
+        run: arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328 firmware/r503fp
+      - name: Compile firmware/r503fp_wipe
+        run: arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328 firmware/r503fp_wipe

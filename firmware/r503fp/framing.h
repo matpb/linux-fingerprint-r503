@@ -73,8 +73,17 @@ inline size_t format_u32(uint32_t n, char* out) {
   return format_u64((uint64_t)n, out);
 }
 
+// Strict decimal `u64` parse. Rejects empty input, non-digit bytes, sign
+// chars, and leading zeros (except the exact "0" case). Strictness closes
+// a parser-hygiene gap mirrored on the daemon side: stdlib accepts "042"
+// as 42, so a captured `C 42 ... M xyz` could be rewritten `C 042 ... M xyz`
+// and pass MAC verify on both sides because both re-format the parsed
+// counter as "42" before MAC compute. The replay-counter check blocks the
+// real attack downstream, but rejecting the malformed input here removes
+// the surface entirely. Crypto-posture review item #6.
 inline bool parse_u64(const char* p, size_t len, uint64_t* out) {
   if (len == 0) return false;
+  if (len > 1 && p[0] == '0') return false; // no leading zeros (allow exact "0")
   uint64_t v = 0;
   for (size_t i = 0; i < len; ++i) {
     char c = p[i];

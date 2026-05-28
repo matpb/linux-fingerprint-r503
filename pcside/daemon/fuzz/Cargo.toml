@@ -1,0 +1,30 @@
+[package]
+name = "r503d-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# cargo-fuzz target for the v2 wire-frame parsers (SPEC §13). Built and run
+# only with nightly Rust:
+#
+#   rustup toolchain install nightly
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run framing -- -max_total_time=3600
+#
+# The stable-Rust property fuzzer in `tests/fuzz_framing_smoke.rs` enforces
+# the same no-panic invariant on every CI run; this corpus exists for the
+# longer coverage-guided runs that strict crypto review wants.
+
+[dependencies]
+r503d = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "framing"
+path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+bench = false
