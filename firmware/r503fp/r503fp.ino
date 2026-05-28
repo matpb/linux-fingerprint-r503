@@ -320,15 +320,28 @@ void process_line(const String& line) {
   // is that we've seen this counter.
   r503::ee_save_counter(ctr);
 
+  // Reject an overlong inner body rather than silently truncating it. The MAC
+  // was verified over the full inner_len bytes, so a memcpy-truncated dispatch
+  // would run a command whose authenticated suffix was dropped (e.g. a future
+  // "enroll 5 confirm" arriving as "enroll 5"). ibuf holds 95 usable bytes; the
+  // longest real command ("verify 199"-class) is ~10, so this never fires for
+  // the current command set — it's a hard wall against a future longer-payload
+  // verb. g_out is still &Serial here, so the error goes out unframed; the
+  // counter is already committed, so the frame can't be replayed.
+  // (Audit 2026-05-28 / M4.)
+  char ibuf[96];
+  if (inner_len >= sizeof(ibuf)) {
+    Serial.println(F("ERR frame_body_too_long"));
+    return;
+  }
+
   g_session_counter = ctr;
   g_session_seq = 0;
   g_framer.reset();
   g_out = &g_framer;
 
   // String constructor needs a NUL terminator; inner is a non-terminated slice.
-  // 96 bytes covers any v2 command body: longest realistic inner cmdline is
-  // ~30 chars ("verify 199"-class commands), so we have ~3x headroom.
-  char ibuf[96];
+  // inner_len < sizeof(ibuf) is guaranteed by the reject above.
   size_t cap = sizeof(ibuf) - 1;
   size_t n = (inner_len < cap) ? inner_len : cap;
   memcpy(ibuf, inner, n);
