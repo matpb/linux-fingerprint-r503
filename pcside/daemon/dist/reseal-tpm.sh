@@ -19,6 +19,17 @@
 
 set -euo pipefail
 
+# Pin PATH before doing anything else. This script runs as root (sudo) and
+# resolves arduino-cli / r503d / systemctl etc. A sudoers rule with
+# `env_keep += PATH` (more common than it should be) would otherwise let a
+# caller prepend an attacker-controlled dir and have a planted `arduino-cli`
+# or `r503d` execute as root. A fixed PATH closes that regardless of the
+# sudoers env policy. r503d lives in /usr/local/bin (dist/install.sh); the
+# arduino-cli lookup (find_arduino_cli) has its own ARDUINO_CLI / $SUDO_USER
+# fallbacks, so this reset doesn't lose it. (Security audit 2026-05-28 / M5.)
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
 # --pcrs <list>  optional PCR list (default 7). Passed through to
 #                r503d --reseal-tpm. Use 7,11 to additionally bind UKI
 #                (kernel+initrd) measurement, etc. SPEC §13.12.
