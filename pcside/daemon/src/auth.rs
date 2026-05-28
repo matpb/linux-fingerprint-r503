@@ -135,25 +135,6 @@ async fn resolve_caller(
     Ok((uid, pid, user))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::validate_username;
-
-    #[test]
-    fn accepts_real_usernames() {
-        for ok in ["mat", "root", "john.doe", "svc-r503", "_systemd", "user1", "a"] {
-            assert!(validate_username(ok).is_ok(), "should accept {ok:?}");
-        }
-    }
-
-    #[test]
-    fn rejects_unsafe_usernames() {
-        for bad in ["", ".", "..", "../etc/shadow", "a/b", "a\\b", "a\nb", "a\0b", "\x07evil"] {
-            assert!(validate_username(bad).is_err(), "should reject {bad:?}");
-        }
-    }
-}
-
 /// Reject a username that could be dangerous if a future code path ever
 /// interpolated it into a file path (it becomes a HashMap key in users.json
 /// today, but path-shaped names are a footgun waiting to happen). No current
@@ -177,4 +158,23 @@ fn validate_username(user: &str) -> Result<(), FprintError> {
         return Err(FprintError::Internal("unsafe username".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_username;
+
+    #[test]
+    fn accepts_real_usernames() {
+        for ok in ["mat", "root", "john.doe", "svc-r503", "_systemd", "user1", "a"] {
+            assert!(validate_username(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_usernames() {
+        for bad in ["", ".", "..", "../etc/shadow", "a/b", "a\\b", "a\nb", "a\0b", "\x07evil"] {
+            assert!(validate_username(bad).is_err(), "should reject {bad:?}");
+        }
+    }
 }

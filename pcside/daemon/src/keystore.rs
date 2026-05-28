@@ -116,10 +116,10 @@ pub fn load_key() -> Option<Zeroizing<[u8; 16]>> {
     // owner-write either, hence the wider 0o177 mask). Both must be a
     // root-owned regular file — see read_key_file_guarded.
     for (p, allow_mask) in [(KEY_PATH, 0o077u32), (KEY_BAK_PATH, 0o177u32)] {
-        if let Some(hex) = read_key_file_guarded(p, allow_mask) {
-            if let Ok(k) = parse_key_hex(hex.trim()) {
-                return Some(k);
-            }
+        if let Some(hex) = read_key_file_guarded(p, allow_mask)
+            && let Ok(k) = parse_key_hex(hex.trim())
+        {
+            return Some(k);
         }
     }
     None
