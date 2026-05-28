@@ -131,5 +131,50 @@ async fn resolve_caller(
         .map_err(|e| FprintError::Internal(format!("GetConnectionUnixProcessID: {}", e)))?;
     let user = crate::dbus_iface::pwd_lookup(uid)
         .ok_or_else(|| FprintError::Internal(format!("uid {} not in passwd", uid)))?;
+    validate_username(&user)?;
     Ok((uid, pid, user))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_username;
+
+    #[test]
+    fn accepts_real_usernames() {
+        for ok in ["mat", "root", "john.doe", "svc-r503", "_systemd", "user1", "a"] {
+            assert!(validate_username(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_usernames() {
+        for bad in ["", ".", "..", "../etc/shadow", "a/b", "a\\b", "a\nb", "a\0b", "\x07evil"] {
+            assert!(validate_username(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+}
+
+/// Reject a username that could be dangerous if a future code path ever
+/// interpolated it into a file path (it becomes a HashMap key in users.json
+/// today, but path-shaped names are a footgun waiting to happen). No current
+/// exploit exists — this is a boundary guard (audit 2026-05-28 / L5).
+///
+/// Deliberately NOT a tight allow-list: we reject only the genuinely unsafe
+/// shapes (empty, `.`/`..`, path separators, NUL and control bytes) so that
+/// any real account a working `getpwuid_r` returns — including locale or
+/// site-specific names a strict `^[a-z_]...$` regex would wrongly bounce —
+/// keeps authenticating. useradd already forbids these characters, so a name
+/// carrying one is anomalous, not legitimate.
+fn validate_username(user: &str) -> Result<(), FprintError> {
+    let bad = user.is_empty()
+        || user == "."
+        || user == ".."
+        || user.contains('/')
+        || user.contains('\\')
+        || user.bytes().any(|b| b == 0 || b.is_ascii_control());
+    if bad {
+        tracing::warn!(user = %user.escape_default().to_string(), "rejecting unsafe username from getpwuid_r");
+        return Err(FprintError::Internal("unsafe username".into()));
+    }
+    Ok(())
 }
