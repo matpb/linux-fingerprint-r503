@@ -189,6 +189,7 @@ struct ActionToken {
 enum ActionKind {
     Enroll,
     Verify,
+    Delete,
 }
 
 impl ActionKind {
@@ -196,6 +197,7 @@ impl ActionKind {
         match self {
             ActionKind::Enroll => "enroll",
             ActionKind::Verify => "verify",
+            ActionKind::Delete => "delete",
         }
     }
 }
@@ -261,6 +263,25 @@ impl Device {
             state: Arc::new(Mutex::new(DeviceState::default())),
             capture_slot: Arc::new(Semaphore::new(1)),
         }
+    }
+
+    /// Acquire the single-in-flight action gate for a delete, mirroring the
+    /// mint-under-lock pattern in verify_start/enroll_start. Returns the token
+    /// the caller MUST clear with `end_action_if_owner` once the sensor work
+    /// finishes (on every exit path). Without this, the delete entry points
+    /// were neither action-gated nor (for the legacy path) claim-gated, so
+    /// concurrent self-invocations each pushed one delete-per-slot onto the
+    /// unbounded worker queue and could flood it, starving auth — a cousin of
+    /// DoS-1 (security audit 2026-05-28 / DEL-1).
+    async fn begin_delete(&self) -> Result<ActionToken, FprintError> {
+        let mut state = self.state.lock().await;
+        if let Some(t) = state.action {
+            return Err(FprintError::AlreadyInUse(format!(
+                "{} already in progress",
+                t.kind.as_str()
+            )));
+        }
+        Ok(state.start_action(ActionKind::Delete))
     }
 
     async fn ensure_claim(&self, sender: Option<&str>) -> Result<String, FprintError> {
@@ -368,7 +389,11 @@ impl Device {
         // but this legacy entry point is still exposed for upstream parity.
         let sender = header.sender().map(|s| s.to_string());
         let user = crate::auth::authorize_username(conn, sender.as_deref(), &username).await?;
-        delete_user_fingers(&self.sensor, &self.storage, &user).await
+        // Gate so concurrent self-calls can't flood the sensor queue (DEL-1).
+        let token = self.begin_delete().await?;
+        let res = delete_user_fingers(&self.sensor, &self.storage, &user).await;
+        self.state.lock().await.end_action_if_owner(token);
+        res
     }
 
     #[zbus(name = "DeleteEnrolledFingers2")]
@@ -378,7 +403,10 @@ impl Device {
     ) -> Result<(), FprintError> {
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
-        delete_user_fingers(&self.sensor, &self.storage, &user).await
+        let token = self.begin_delete().await?;
+        let res = delete_user_fingers(&self.sensor, &self.storage, &user).await;
+        self.state.lock().await.end_action_if_owner(token);
+        res
     }
 
     async fn delete_enrolled_finger(
@@ -396,7 +424,11 @@ impl Device {
             .ok_or_else(|| {
                 FprintError::NoEnrolledPrints(format!("{} not enrolled for {}", finger_name, user))
             })?;
+        // Gate the sensor work so concurrent deletes can't flood the queue
+        // (DEL-1). Cleared on every exit path below.
+        let token = self.begin_delete().await?;
         if let Err(e) = self.sensor.delete(slot).await {
+            self.state.lock().await.end_action_if_owner(token);
             tracing::warn!("sensor delete slot {} failed: {}", slot, e);
             return Err(FprintError::PrintsNotDeleted(format!(
                 "sensor delete failed for slot {}: {}",
@@ -404,7 +436,9 @@ impl Device {
             )));
         }
         // Sensor template gone; registry remove is the bookkeeping tail.
-        self.storage.remove_finger(&user, &finger_name).await?;
+        let res = self.storage.remove_finger(&user, &finger_name).await;
+        self.state.lock().await.end_action_if_owner(token);
+        res?;
         Ok(())
     }
 
@@ -1028,5 +1062,24 @@ mod capture_slot_tests {
         // The real owner clears cleanly.
         assert!(s.end_action_if_owner(t2));
         assert!(s.action.is_none());
+    }
+
+    /// DEL-1: a Delete shares the single-in-flight slot with enroll/verify, so
+    /// `begin_delete`'s gate (action.is_some()) rejects concurrent deletes and
+    /// is mutually exclusive with an in-flight capture.
+    #[test]
+    fn delete_shares_the_single_action_slot() {
+        assert_eq!(ActionKind::Delete.as_str(), "delete");
+
+        let mut s = DeviceState::default();
+        // A delete installs a token; a second begin_delete would see Some(..).
+        let d = s.start_action(ActionKind::Delete);
+        assert!(s.action.is_some(), "delete holds the slot -> AlreadyInUse");
+        assert!(s.end_action_if_owner(d));
+        assert!(s.action.is_none());
+
+        // A live verify must also block a delete (begin_delete sees Some).
+        let _v = s.start_action(ActionKind::Verify);
+        assert!(s.action.is_some());
     }
 }
