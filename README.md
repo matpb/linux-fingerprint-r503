@@ -143,7 +143,12 @@ That script:
 - installs `target/release/r503d` to `/usr/local/bin/r503d`
 - creates `/var/lib/r503d/` (mode 0700 root:root) for the key, state, and
   user-slot registry
-- writes the udev rule that exposes the Arduino as `/dev/r503`
+- writes the udev rule that exposes the Arduino as `/dev/r503` and locks the
+  device node to `root:root 0600` (only the daemon, running as root, needs it;
+  this closes the default `0660 root:dialout` path so no other local user can
+  open the port — security audit 2026-05-28 / H1). **Consequence:** after
+  install, any manual `arduino-cli`/serial-monitor command against `/dev/r503`
+  needs `sudo`.
 - installs the systemd unit (`/etc/systemd/system/r503d.service`)
 - overrides the D-Bus autolaunch entry for `net.reactivated.Fprint`
 - installs the polkit action
@@ -302,13 +307,18 @@ PCR7-changed case above:
 
 ```bash
 sudo systemctl stop r503d
-arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp_wipe/
+# /dev/r503 is root:root 0600 since install (audit H1), so the uploads need root.
+sudo arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp_wipe/
 # Wait ~1s for the wipe to complete (LED starts blinking — that's the wipe sketch).
-arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp/
+sudo arduino-cli upload --fqbn arduino:avr:nano:cpu=atmega328 --port /dev/r503 firmware/r503fp/
 sudo touch /etc/r503d/allow-pair
 sudo r503d --pair
 sudo systemctl start r503d
 ```
+
+If `sudo arduino-cli` reports command-not-found (arduino-cli lives in your
+`~/.local/bin`, not on root's `PATH`), run it as
+`sudo env "PATH=$PATH" arduino-cli …` or give the absolute path.
 
 This isn't a backdoor an attacker can use: re-pairing requires root on
 the host (the opt-in file and the `--pair` CLI both need root), so a
@@ -371,11 +381,19 @@ process on `/dev/r503` — not nation-states or hardware attackers with
 labs. Single-user desktop deployment with a documented out-of-scope list.
 The full threat model lives in [`SPEC.md` §13.1](SPEC.md); the
 implementation-and-review evidence lives in
-[`docs/REVIEW-2026-05-28.md`](docs/REVIEW-2026-05-28.md).
+[`docs/REVIEW-2026-05-28.md`](docs/REVIEW-2026-05-28.md). A separate
+adversarial privilege-escalation audit (2026-05-28) and its per-claim
+validation/remediation pass are at
+[`docs/SECURITY-AUDIT-2026-05-28.html`](docs/SECURITY-AUDIT-2026-05-28.html)
+and
+[`docs/SECURITY-AUDIT-2026-05-28-VALIDATION.html`](docs/SECURITY-AUDIT-2026-05-28-VALIDATION.html).
 
 **Defended:**
 - Hot-swap of the Nano with a hostile unit (no key → all frames fail MAC).
-- Local process injecting fake match responses on `/dev/r503` (same).
+- Local process injecting fake match responses on `/dev/r503`. Two layers:
+  the device node is `root:root 0600` (udev rule) and the daemon holds it
+  with `TIOCEXCL`, so a non-root process can't open it — and even if it
+  could, it has no key, so the frame fails MAC verify.
 - Replay of recorded `OK match=...` frames in a future session.
 - Bit-flip tampering of any frame field (constant-time MAC compare).
 - Cross-user fingerprint plant / wipe / enumeration by a local non-root
@@ -405,7 +423,8 @@ implementation-and-review evidence lives in
   `siphasher` crate on 1024 random vectors in CI). Host MAC compare uses
   `subtle::ConstantTimeEq`. Wire parsers property-fuzzed on every CI run
   (~135 000 inputs). `cargo audit` clean. SipHash key wrapped in
-  `zeroize::Zeroizing<...>` so it scrubs on drop. A `cargo fuzz`
+  `zeroize::Zeroizing<...>` so it scrubs on drop (as are the per-frame
+  MAC-input buffers). A `cargo fuzz`
   libFuzzer target ships at `pcside/daemon/fuzz/` for long-corpus runs on
   nightly. No paid third-party human audit — that would still be
   valuable, PRs welcome.
