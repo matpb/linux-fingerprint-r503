@@ -16,18 +16,28 @@
 # After editing this file:
 #   sudo udevadm control --reload && sudo udevadm trigger
 
+# Permissions: r503d runs as root and the systemd unit grants it
+# DeviceAllow=char-ttyACM rw + char-ttyUSB rw, so the device only needs to be
+# reachable by root. Default distro permissions (0660 root:dialout) would let
+# any dialout-group user open /dev/r503 directly and either DoS the daemon by
+# injecting bytes or — during the brief unpaired window of a reseal — race the
+# daemon to send "pair <attacker_hex>" to a freshly wiped Nano. Lock it down
+# to root:root 0600 on every matching rule. (Security audit 2026-05-28 / H1.)
+# Open the port exclusively (TIOCEXCL) in the daemon as a belt-and-suspenders
+# layer for hosts that ship more permissive defaults than this rule anticipates.
+
 # Arduino LLC — genuine Uno, Mega, Leonardo, Micro, Nano Every, Nano IoT, etc.
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2341", SYMLINK+="r503", TAG+="r503-device"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2341", SYMLINK+="r503", TAG+="r503-device", OWNER="root", GROUP="root", MODE="0600"
 
 # Arduino SRL — the legacy arduino.org fork (still in the wild on some boards)
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2a03", SYMLINK+="r503", TAG+="r503-device"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2a03", SYMLINK+="r503", TAG+="r503-device", OWNER="root", GROUP="root", MODE="0600"
 
 # WCH CH340/CH341 USB-serial — used on most Nano clones (Elegoo, SunFounder, Keyestudio, etc.)
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="r503", TAG+="r503-device"
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5523", SYMLINK+="r503", TAG+="r503-device"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="r503", TAG+="r503-device", OWNER="root", GROUP="root", MODE="0600"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="5523", SYMLINK+="r503", TAG+="r503-device", OWNER="root", GROUP="root", MODE="0600"
 
 # FTDI FT232RL — older Nanos with FTDI bridge; also some Diecimila clones
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="r503", TAG+="r503-device"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="r503", TAG+="r503-device", OWNER="root", GROUP="root", MODE="0600"
 
 # Silicon Labs CP2102/CP2104 — found on some clone boards and ESP8266 dev boards
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="r503", TAG+="r503-device"
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", SYMLINK+="r503", TAG+="r503-device", OWNER="root", GROUP="root", MODE="0600"

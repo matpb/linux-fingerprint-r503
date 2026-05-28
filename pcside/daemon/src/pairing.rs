@@ -36,8 +36,13 @@ struct Link {
 
 impl Link {
     fn open(path: &str) -> Result<Self> {
+        // .exclusive(true) is the serialport-4.x POSIX default; setting it
+        // explicitly keeps the TIOCEXCL + LOCK_EX guarantee visible at the
+        // call site and pins us against a future crate-default flip
+        // (security audit 2026-05-28 / H1).
         let port = serialport::new(path, BAUD)
             .timeout(Duration::from_millis(200))
+            .exclusive(true)
             .open()
             .with_context(|| format!("opening {}", path))?;
         let mut link = Link { port, rx: Vec::new() };

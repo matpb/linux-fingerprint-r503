@@ -91,8 +91,14 @@ impl R503 {
             Some(p) => p.to_string(),
             None => find_port()?,
         };
+        // .exclusive(true) sets TIOCEXCL + flock LOCK_EX on the fd so a
+        // second open(2) from any non-root process returns EBUSY. This is
+        // ALREADY the serialport-4.x POSIX default, but we set it explicitly
+        // so a future crate-default flip can't silently downgrade us — and
+        // so the security posture is obvious to a reader (audit 2026-05-28).
         let port = serialport::new(&path, DEFAULT_BAUD)
             .timeout(Duration::from_millis(200))
+            .exclusive(true)
             .open()
             .map_err(|e| SensorError::OpenFailed {
                 path: path.clone(),
