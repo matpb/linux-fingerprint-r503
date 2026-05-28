@@ -25,6 +25,13 @@ const TIMEOUT_LED_MS: u64 = 2_000;
 const TIMEOUT_WAKE_MS: u64 = 2_000;
 const TIMEOUT_PING_MS: u64 = 2_000;
 
+// Hard cap on a single inbound line. The longest realistic framed reply
+// (SPEC §13) is ~120 bytes; 4 KiB is ~30x that. A run-on stream of
+// non-'\n' bytes — either a glitchy firmware or a co-opener of /dev/r503
+// who slipped past H1's exclusive lock — would otherwise grow rx_buf
+// without bound and OOM the daemon (security audit 2026-05-28 / M1).
+const MAX_LINE_LEN: usize = 4096;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SensorError {
     #[error("no R503 serial device at /dev/ttyACM* or /dev/ttyUSB*; is the Uno plugged in?")]
@@ -247,6 +254,17 @@ impl R503 {
                     line.pop();
                 }
                 return Ok(Some(line));
+            }
+            if self.rx_buf.len() > MAX_LINE_LEN {
+                // No newline within the cap. Discard everything pending,
+                // flush the kernel input queue, and surface a Protocol
+                // error so the caller can decide whether to retry or fail.
+                self.rx_buf.clear();
+                let _ = self.port.clear(serialport::ClearBuffer::Input);
+                return Err(SensorError::Protocol(format!(
+                    "line exceeded {} bytes without newline (sensor noise or co-opener?)",
+                    MAX_LINE_LEN
+                )));
             }
             let now = Instant::now();
             if now >= deadline {
