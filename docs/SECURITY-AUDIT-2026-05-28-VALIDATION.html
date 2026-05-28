@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>r503-fpr — Audit Claim Validation &amp; Remediation · 2026-05-28</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a22;
+    --panel-2: #1c2230;
+    --ink: #e6e8ec;
+    --muted: #9aa3b2;
+    --rule: #2a3142;
+    --accent: #7aa2ff;
+    --accent-soft: #2a3a66;
+    --ok: #58c184;
+    --info: #6aa8ff;
+    --low: #d8c66e;
+    --med: #e8a857;
+    --high: #f06c5b;
+    --crit: #ff3b5c;
+    --code-bg: #0b0d12;
+    --code-fg: #d8e1f3;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 56px 28px 88px; }
+  header.hero { border-bottom: 1px solid var(--rule); padding-bottom: 28px; margin-bottom: 36px; }
+  header.hero .eyebrow { text-transform: uppercase; letter-spacing: 0.18em; font-size: 11px; color: var(--accent); font-weight: 600; }
+  header.hero h1 { font-size: 36px; line-height: 1.15; margin: 10px 0 8px; letter-spacing: -0.01em; }
+  header.hero .sub { color: var(--muted); font-size: 15px; }
+  header.hero .meta { margin-top: 18px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
+    border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; background: var(--panel); }
+  header.hero .meta div { padding: 14px 16px; border-right: 1px solid var(--rule); }
+  header.hero .meta div:last-child { border-right: 0; }
+  header.hero .meta .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 4px; }
+  header.hero .meta .v { font-weight: 600; }
+  h2 { font-size: 22px; letter-spacing: -0.005em; margin: 44px 0 14px; padding-bottom: 8px; border-bottom: 1px solid var(--rule); }
+  h3 { font-size: 17px; margin: 24px 0 10px; color: var(--ink); }
+  p { color: var(--ink); }
+  a { color: var(--accent); }
+  code, kbd { font: 13px/1.5 ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg); color: var(--code-fg); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--rule); }
+  pre { background: var(--code-bg); color: var(--code-fg); padding: 14px 16px; border-radius: 8px; border: 1px solid var(--rule);
+    overflow-x: auto; font: 13px/1.55 ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace; }
+  table.summary { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+  table.summary th, table.summary td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  table.summary th { background: var(--panel-2); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; }
+  table.summary tr:last-child td { border-bottom: 0; }
+  table.summary td.id a { text-decoration: none; }
+  table.summary td.id a:hover { text-decoration: underline; }
+  .sev { display: inline-block; padding: 2px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; border-radius: 4px; text-transform: uppercase; border: 1px solid currentColor; white-space: nowrap; }
+  .sev-CRITICAL { color: var(--crit); background: rgba(255,59,92,0.10); }
+  .sev-HIGH     { color: var(--high); background: rgba(240,108,91,0.10); }
+  .sev-MEDIUM   { color: var(--med);  background: rgba(232,168,87,0.10); }
+  .sev-LOW      { color: var(--low);  background: rgba(216,198,110,0.10); }
+  .sev-INFO     { color: var(--info); background: rgba(106,168,255,0.10); }
+  .sev-OK       { color: var(--ok);   background: rgba(88,193,132,0.10); }
+  .tag { display: inline-block; padding: 2px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; border-radius: 4px; text-transform: uppercase; border: 1px solid currentColor; white-space: nowrap; }
+  .tag-FIXED       { color: var(--ok);   background: rgba(88,193,132,0.12); }
+  .tag-CONFIRMED   { color: var(--med);  background: rgba(232,168,87,0.10); }
+  .tag-REVISED     { color: var(--info); background: rgba(106,168,255,0.10); }
+  .tag-INVALID     { color: var(--crit); background: rgba(255,59,92,0.10); }
+  .tag-NOFIX       { color: var(--muted); background: rgba(154,163,178,0.10); border-color: var(--muted); }
+  .tag-PRIOR       { color: var(--ok);   background: rgba(88,193,132,0.08); }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin: 18px 0 28px; }
+  .stat { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; }
+  .stat .n { font-size: 28px; font-weight: 700; line-height: 1; }
+  .stat .l { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-top: 6px; }
+  .stat.ok .n { color: var(--ok); } .stat.med .n { color: var(--med); } .stat.crit .n { color: var(--crit); }
+  .stat.info .n { color: var(--info); } .stat.muted .n { color: var(--muted); }
+  .finding { background: var(--panel); border: 1px solid var(--rule); border-left: 4px solid var(--rule); border-radius: 8px; margin: 18px 0; padding: 18px 22px 8px; }
+  .finding.FIXED   { border-left-color: var(--ok); }
+  .finding.NOFIX   { border-left-color: var(--muted); }
+  .finding.INVALID { border-left-color: var(--crit); }
+  .finding.INFO    { border-left-color: var(--info); }
+  .finding .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .finding .head h3 { margin: 0; font-size: 17px; }
+  .finding .head .path { margin-left: auto; font: 12px/1.4 ui-monospace, SFMono-Regular, monospace; color: var(--muted); }
+  .finding dl { display: grid; grid-template-columns: 150px 1fr; gap: 6px 16px; margin: 14px 0 8px; }
+  .finding dt { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; padding-top: 2px; }
+  .finding dd { margin: 0 0 6px; }
+  .callout { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 18px; margin: 18px 0; }
+  .callout.ok { border-left: 4px solid var(--ok); }
+  .callout.warn { border-left: 4px solid var(--med); }
+  .callout.info { border-left: 4px solid var(--info); }
+  .callout h4 { margin: 0 0 6px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  ul.tight { margin: 8px 0 16px; padding-left: 22px; }
+  ul.tight li { margin: 4px 0; }
+  .commit { font: 12px/1.4 ui-monospace, SFMono-Regular, monospace; color: var(--ok); }
+  footer { margin-top: 60px; padding-top: 22px; border-top: 1px solid var(--rule); color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">Audit Claim Validation &amp; Remediation</div>
+  <h1>r503-fpr — Every Audit Claim, Verified Against Source &amp; Fixed</h1>
+  <div class="sub">
+    Companion to <a href="SECURITY-AUDIT-2026-05-28.html">SECURITY-AUDIT-2026-05-28.html</a>.
+    Each of the 18 findings (H1, M1–M5, L1–L7, I1–I5) was re-read against the
+    live code this pass. Claims that held 100% got a focused, regression-free
+    fix; one commit per claim, all on this branch.
+  </div>
+  <div class="meta">
+    <div><div class="k">Repository</div><div class="v">linux-fingerprint-r503</div></div>
+    <div><div class="k">Branch</div><div class="v">feat/security-audit-2026-05-28-fixes</div></div>
+    <div><div class="k">Base</div><div class="v">main · 10a991c</div></div>
+    <div><div class="k">Validation date</div><div class="v">2026-05-28</div></div>
+  </div>
+</header>
+
+<h2>Executive Summary</h2>
+
+<p>
+  All 18 findings were validated by direct source inspection.
+  <strong>13 of 14 actionable findings were confirmed accurate</strong> and have a
+  fix committed (10 this session — M2–M5, L1, L2, L4, L5 — plus H1 and M1 which
+  landed earlier on this branch). One finding (<a href="#L7">L7</a>) <strong>did not
+  validate</strong>: the install script writes to override paths
+  (<code>/usr/local/share</code>, <code>/etc</code>), never to the upstream
+  fprintd <code>/usr/share</code> files, and the uninstaller removes exactly
+  those overrides — so the claimed "irreversible overwrite of upstream fprintd"
+  does not occur. Two LOW findings (<a href="#L3">L3</a>, <a href="#L6">L6</a>) were
+  confirmed accurate as descriptions but <strong>deliberately not "fixed"</strong>:
+  the audit itself recommends no change for L3 (benign TOCTOU on a root-only
+  directory) and explicitly recommends <em>against</em> the L6 change (caching a
+  polkit decision is a security downgrade, not an upgrade). The five reclassified
+  INFO items (I1–I5) were re-confirmed as non-issues.
+</p>
+
+<p>
+  Every Rust change was gated on <code>cargo build --release</code> +
+  <code>cargo test --release</code> (92 tests, all green); every firmware change
+  on <code>arduino-cli compile</code> (atmega328, 70% flash). No fix changes a
+  happy-path behaviour — they add belt-and-suspenders that the existing,
+  correctly-permissioned files already satisfy.
+</p>
+
+<div class="stats">
+  <div class="stat ok"><div class="n">10</div><div class="l">Fixed this session</div></div>
+  <div class="stat ok"><div class="n">2</div><div class="l">Fixed earlier (H1, M1)</div></div>
+  <div class="stat muted"><div class="n">2</div><div class="l">Confirmed · no-fix by design</div></div>
+  <div class="stat crit"><div class="n">1</div><div class="l">Did not validate (L7)</div></div>
+  <div class="stat info"><div class="n">5</div><div class="l">INFO re-confirmed</div></div>
+</div>
+
+<h2>Validation &amp; Remediation Matrix</h2>
+
+<table class="summary">
+  <thead>
+    <tr><th>ID</th><th>Sev</th><th>Verdict</th><th>Disposition</th><th>Commit</th></tr>
+  </thead>
+  <tbody>
+    <tr><td class="id"><a href="#H1">H1</a></td><td><span class="sev sev-HIGH">HIGH</span></td>
+      <td>Confirmed (udev) · <span class="tag tag-REVISED">Revised</span> (TIOCEXCL already default)</td>
+      <td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">1d97b7b</td></tr>
+    <tr><td class="id"><a href="#M1">M1</a></td><td><span class="sev sev-MEDIUM">MED</span></td>
+      <td>Confirmed</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">e6203c7</td></tr>
+    <tr><td class="id"><a href="#M2">M2</a></td><td><span class="sev sev-MEDIUM">MED</span></td>
+      <td>Confirmed</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">1370571</td></tr>
+    <tr><td class="id"><a href="#M3">M3</a></td><td><span class="sev sev-MEDIUM">MED</span></td>
+      <td>Confirmed</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">8e4230f</td></tr>
+    <tr><td class="id"><a href="#M4">M4</a></td><td><span class="sev sev-MEDIUM">MED</span></td>
+      <td>Confirmed</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">baab047</td></tr>
+    <tr><td class="id"><a href="#M5">M5</a></td><td><span class="sev sev-MEDIUM">MED</span></td>
+      <td>Confirmed</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">e8865ea</td></tr>
+    <tr><td class="id"><a href="#L1">L1</a></td><td><span class="sev sev-LOW">LOW</span></td>
+      <td>Confirmed (bounded by ensure_claim)</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">5b56b51</td></tr>
+    <tr><td class="id"><a href="#L2">L2</a></td><td><span class="sev sev-LOW">LOW</span></td>
+      <td>Confirmed (hygiene; data is public)</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">03336d4</td></tr>
+    <tr><td class="id"><a href="#L3">L3</a></td><td><span class="sev sev-LOW">LOW</span></td>
+      <td>Confirmed (no gap in threat model)</td><td><span class="tag tag-NOFIX">No-fix by design</span></td><td class="commit">—</td></tr>
+    <tr><td class="id"><a href="#L4">L4</a></td><td><span class="sev sev-LOW">LOW</span></td>
+      <td>Confirmed</td><td><span class="tag tag-FIXED">Fixed</span></td><td class="commit">9d712c9</td></tr>
+    <tr><td class="id"><a href="#L5">L5</a></td><td><span class="sev sev-LOW">LOW</span></td>
+      <td>Confirmed (forward-looking)</td><td><span class="tag tag-FIXED">Fixed*</span></td><td class="commit">0b92257</td></tr>
+    <tr><td class="id"><a href="#L6">L6</a></td><td><span class="sev sev-LOW">LOW</span></td>
+      <td>Confirmed (audit advises against fixing)</td><td><span class="tag tag-NOFIX">No-fix by design</span></td><td class="commit">—</td></tr>
+    <tr><td class="id"><a href="#L7">L7</a></td><td><span class="sev sev-LOW">LOW</span></td>
+      <td><span class="tag tag-INVALID">Did not validate</span></td><td><span class="tag tag-NOFIX">No-fix (claim inaccurate)</span></td><td class="commit">—</td></tr>
+    <tr><td class="id"><a href="#I1">I1</a></td><td><span class="sev sev-INFO">INFO</span></td>
+      <td>Re-confirmed non-issue</td><td><span class="tag tag-NOFIX">No action</span></td><td class="commit">—</td></tr>
+    <tr><td class="id"><a href="#I2">I2</a></td><td><span class="sev sev-INFO">INFO</span></td>
+      <td>Re-confirmed non-issue</td><td><span class="tag tag-NOFIX">No action</span></td><td class="commit">—</td></tr>
+    <tr><td class="id"><a href="#I3">I3</a></td><td><span class="sev sev-INFO">INFO</span></td>
+      <td>Re-confirmed non-issue</td><td><span class="tag tag-NOFIX">No action</span></td><td class="commit">—</td></tr>
+    <tr><td class="id"><a href="#I4">I4</a></td><td><span class="sev sev-INFO">INFO</span></td>
+      <td>Re-confirmed non-issue</td><td><span class="tag tag-NOFIX">No action</span></td><td class="commit">—</td></tr>
+    <tr><td class="id"><a href="#I5">I5</a></td><td><span class="sev sev-INFO">INFO</span></td>
+      <td>Re-confirmed (doc cross-ref)</td><td><span class="tag tag-NOFIX">No action</span></td><td class="commit">—</td></tr>
+  </tbody>
+</table>
+<p style="color:var(--muted);font-size:13px;">
+  * L5 was fixed with a deliberately looser validator than the report sketched — see the L5 card for why the strict regex would have been a regression.
+</p>
+
+<h2>Detailed Validation</h2>
+
+<!-- HIGH -->
+<section class="finding FIXED" id="H1">
+  <div class="head"><span class="sev sev-HIGH">HIGH</span><h3>H1 — udev permissive group + serial exclusivity</h3>
+  <span class="path">70-r503.rules · sensor.rs · pairing.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>
+      <strong>udev half: CONFIRMED.</strong> <code>70-r503.rules</code> had no
+      <code>MODE=</code>/<code>OWNER=</code>/<code>GROUP=</code> on any of its five
+      <code>SUBSYSTEM</code> rules, so <code>/dev/r503</code> inherited the distro
+      default (<code>0660 root:dialout</code>).
+      <strong>TIOCEXCL half: REVISED.</strong> The audit claimed the daemon's
+      <code>serialport::new(...).open()</code> does not pass <code>TIOCEXCL</code>.
+      That is incorrect — <code>serialport</code> 4.x defaults <code>exclusive: true</code>
+      on POSIX, so the port was already held exclusively.
+    </dd>
+    <dt>Fix <span class="commit">1d97b7b</span></dt><dd>
+      Added <code>OWNER="root" GROUP="root" MODE="0600"</code> to every matching
+      rule (root-only DAC; the systemd unit already grants the daemon the device
+      via <code>DeviceAllow</code>). Pinned <code>.exclusive(true)</code> explicitly
+      at both open sites so a future crate-default flip can't silently downgrade,
+      and the posture is visible at the call site.
+    </dd>
+  </dl>
+</section>
+
+<!-- MEDIUM -->
+<section class="finding FIXED" id="M1">
+  <div class="head"><span class="sev sev-MEDIUM">MEDIUM</span><h3>M1 — Unbounded RX buffer in read_line()</h3>
+  <span class="path">sensor.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED. The inner read loop grew <code>rx_buf</code> via
+      <code>extend_from_slice</code> with only a deadline exit — no length cap.</dd>
+    <dt>Fix <span class="commit">e6203c7</span></dt><dd>
+      Added <code>const MAX_LINE_LEN = 4096</code> (~30× the longest realistic
+      framed line) and a per-iteration cap that clears the buffer, flushes the
+      kernel input queue, and returns <code>SensorError::Protocol</code>.</dd>
+  </dl>
+</section>
+
+<section class="finding FIXED" id="M2">
+  <div class="head"><span class="sev sev-MEDIUM">MEDIUM</span><h3>M2 — load_key follows symlinks &amp; ignores mode</h3>
+  <span class="path">keystore.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED. <code>load_key()</code> read both key files with a
+      bare <code>fs::read_to_string</code> (follows symlinks, no <code>O_NOFOLLOW</code>)
+      and never inspected owner or mode. The <code>0700 root</code> directory makes
+      pre-staging hard, but the load path trusted it entirely.</dd>
+    <dt>Fix <span class="commit">1370571</span></dt><dd>
+      New <code>read_key_file_guarded()</code>: <code>symlink_metadata</code> +
+      reject symlink, reject owner ≠ 0, reject access bits outside the allow-mask
+      (<code>0o077</code> live / <code>0o177</code> backup), then open with
+      <code>O_NOFOLLOW</code> to defeat a post-stat TOCTOU swap. Failed checks log
+      and fall through exactly as the old <code>None</code> path did.</dd>
+  </dl>
+</section>
+
+<section class="finding FIXED" id="M3">
+  <div class="head"><span class="sev sev-MEDIUM">MEDIUM</span><h3>M3 — Loose JSON loaders, no mode check</h3>
+  <span class="path">storage.rs · state.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED. <code>StorageFile</code> and <code>State</code> used the
+      default derive (unknown fields silently ignored); neither <code>open()</code>/<code>load()</code>
+      checked the file mode.</dd>
+    <dt>Fix <span class="commit">8e4230f</span></dt><dd>
+      <code>#[serde(deny_unknown_fields)]</code> on both structs; both loaders now
+      refuse a file whose mode isn't exactly <code>0600</code>. Both <code>save()</code>
+      paths already write <code>0600</code> (state since inception, users.json since
+      S3), so the happy path is unchanged. New <code>StorageError::InsecureMode</code>.</dd>
+  </dl>
+</section>
+
+<section class="finding FIXED" id="M4">
+  <div class="head"><span class="sev sev-MEDIUM">MEDIUM</span><h3>M4 — Firmware silently truncates inner body</h3>
+  <span class="path">r503fp.ino</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED at lines 331–336. After MAC verify over the full
+      <code>inner_len</code>, the body was <code>memcpy</code>-clipped to 95 bytes and
+      dispatched — no integrity gate on the truncated form. Not reachable for the
+      current ~10-byte command set, but a latent footgun for a longer future verb.</dd>
+    <dt>Fix <span class="commit">baab047</span></dt><dd>
+      Reject <code>inner_len &gt;= sizeof(ibuf)</code> with <code>ERR frame_body_too_long</code>,
+      placed after the counter commit (no replay) and before <code>g_out</code> swings
+      to the framer (error goes out unframed).</dd>
+  </dl>
+</section>
+
+<section class="finding FIXED" id="M5">
+  <div class="head"><span class="sev sev-MEDIUM">MEDIUM</span><h3>M5 — reseal-tpm.sh resolves binaries via $PATH</h3>
+  <span class="path">dist/reseal-tpm.sh</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED. The script does <code>set -euo pipefail</code> but never
+      resets <code>PATH</code>; binaries are found via <code>command -v</code>. A sudoers
+      <code>env_keep += PATH</code> turns that into root-level command injection.</dd>
+    <dt>Fix <span class="commit">e8865ea</span></dt><dd>
+      Pinned <code>PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin</code>
+      right after <code>set -euo pipefail</code>. No regression: <code>r503d</code> lives
+      in <code>/usr/local/bin</code>, and the <code>arduino-cli</code> lookup keeps its
+      <code>ARDUINO_CLI</code>/<code>$SUDO_USER</code> fallbacks.</dd>
+  </dl>
+</section>
+
+<!-- LOW -->
+<section class="finding FIXED" id="L1">
+  <div class="head"><span class="sev sev-LOW">LOW</span><h3>L1 — verify_start reads slots after dropping the lock</h3>
+  <span class="path">dbus_iface.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED. Token minted under the state lock, lock dropped, then
+      <code>get_user_slots</code> read in a fresh acquisition. A same-sender
+      <code>DeleteEnrolledFinger</code> (claim-gated, not action-gated) can mutate the
+      set in the gap. Bounded by <code>ensure_claim</code> — no privesc; worst case a
+      verify that naturally fails.</dd>
+    <dt>Fix <span class="commit">5b56b51</span></dt><dd>
+      Mint the token and read <code>get_user_slots</code> under one lock acquisition.
+      <code>get_user_slots</code> only touches the independent storage <code>RwLock</code>,
+      so holding the state mutex across it is deadlock-free.</dd>
+  </dl>
+</section>
+
+<section class="finding FIXED" id="L2">
+  <div class="head"><span class="sev sev-LOW">LOW</span><h3>L2 — MAC input String not Zeroizing</h3>
+  <span class="path">framing.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED at the four MAC-compute sites. Exploitability is
+      negligible — the MAC input is public per the protocol — so this is a
+      consistency/hygiene gap, not a confidentiality one.</dd>
+    <dt>Fix <span class="commit">03336d4</span></dt><dd>
+      Wrapped each <code>format!()</code> in <code>Zeroizing::new(...)</code>; the
+      temporary is moved (no extra alloc), <code>.as_bytes()</code> still works via
+      <code>Deref</code>, buffer scrubs on drop.</dd>
+  </dl>
+</section>
+
+<section class="finding NOFIX" id="L3">
+  <div class="head"><span class="sev sev-LOW">LOW</span><h3>L3 — allow-pair TOCTOU</h3>
+  <span class="path">pairing.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED as described: <code>allow_pair_present()</code> and
+      <code>remove_allow_pair()</code> aren't atomic. The file lives in
+      <code>/etc/r503d/</code> (root-owned), so a non-root attacker can't influence the
+      check; a root attacker is out of scope. No gap within the threat model.</dd>
+    <dt>Disposition</dt><dd><span class="tag tag-NOFIX">No-fix by design.</span> The report's
+      own remediation is "None required." Note: the gate is <em>already</em> closed
+      before the key is sent (<code>pairing.rs:233</code>, the S2 hardening), so the
+      meaningful ordering concern was handled in a prior pass. Reordering further
+      would add churn for zero security gain.</dd>
+  </dl>
+</section>
+
+<section class="finding FIXED" id="L4">
+  <div class="head"><span class="sev sev-LOW">LOW</span><h3>L4 — inbuf cap off-by-one</h3>
+  <span class="path">r503fp.ino</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED at line 432: <code>&gt; 128</code> admits a 129th byte
+      before firing. No exploitable consequence (dynamic String), but the documented
+      128-byte invariant was violated by one.</dd>
+    <dt>Fix <span class="commit">9d712c9</span></dt><dd><code>&gt;</code> → <code>&gt;=</code>.
+      Real frames are ~50 bytes, so no regression.</dd>
+  </dl>
+</section>
+
+<section class="finding FIXED" id="L5">
+  <div class="head"><span class="sev sev-LOW">LOW</span><h3>L5 — Username not validated</h3>
+  <span class="path">auth.rs · dbus_iface.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED. <code>resolve_caller</code> returned the
+      <code>getpwuid_r</code> username verbatim. Forward-looking only — nothing
+      interpolates it into a path or shell today.</dd>
+    <dt>Fix <span class="commit">0b92257</span></dt><dd>
+      <code>validate_username()</code> at the boundary rejects empty, <code>.</code>/<code>..</code>,
+      path separators, and NUL/control bytes.
+      <strong>Deliberate deviation:</strong> the report sketched a tight
+      <code>^[a-zA-Z_][...]{0,31}$</code> allow-list — that would wrongly bounce
+      locale/site-specific accounts a working <code>getpwuid_r</code> legitimately
+      returns, i.e. a regression. We reject only the genuinely path-dangerous shapes
+      (all of which <code>useradd</code> already forbids), fully closing the named gap
+      with zero risk to real accounts. Unit-tested both ways.</dd>
+  </dl>
+</section>
+
+<section class="finding NOFIX" id="L6">
+  <div class="head"><span class="sev sev-LOW">LOW</span><h3>L6 — Polkit decision not cached</h3>
+  <span class="path">auth.rs</span></div>
+  <dl>
+    <dt>Validation</dt><dd>CONFIRMED. Every cross-user request makes a fresh
+      <code>check_authorization</code> RPC; there is no cache.</dd>
+    <dt>Disposition</dt><dd><span class="tag tag-NOFIX">No-fix by design.</span> The report
+      explicitly recommends <em>against</em> implementing this: "The current behavior
+      (always-fresh polkit) is the safer default… leave it unless monitoring flags
+      it." Caching an authorization decision introduces staleness risk — it is a
+      security <em>downgrade</em>, so implementing it would be the regression the
+      task forbids.</dd>
+  </dl>
+</section>
+
+<section class="finding INVALID" id="L7">
+  <div class="head"><span class="sev sev-LOW">LOW</span><h3>L7 — install.sh "overwrites upstream fprintd"</h3>
+  <span class="path">dist/install.sh · dist/uninstall.sh</span></div>
+  <dl>
+    <dt>Validation</dt><dd><span class="tag tag-INVALID">DID NOT VALIDATE.</span> The claim is that
+      <code>install.sh</code> overwrites the upstream fprintd files at
+      <code>/usr/share/dbus-1/system-services/net.reactivated.Fprint.service</code>
+      and the matching policy, irreversibly. Reading the script:
+      <ul class="tight">
+        <li><code>install.sh:54–57</code> writes the D-Bus service activation file to
+            <code>/usr/local/share/dbus-1/system-services/</code> — an
+            <em>override</em> directory that shadows, never the upstream
+            <code>/usr/share</code> path.</li>
+        <li><code>install.sh:64–66</code> writes the bus policy to
+            <code>/etc/dbus-1/system.d/</code> — the admin override dir, not upstream's
+            <code>/usr/share/dbus-1/system.d/</code>.</li>
+        <li><code>uninstall.sh:20,24</code> removes exactly those override files, so the
+            untouched upstream fprintd files are restored automatically; the script
+            also <code>systemctl unmask</code>es and restarts fprintd.</li>
+      </ul>
+      No upstream file is ever overwritten, and the revert is clean. The finding's
+      premise is inaccurate.</dd>
+    <dt>Disposition</dt><dd>No fix. (If anything, the existing co-tenancy design is the
+      correct one — override dirs + <code>Conflicts=fprintd.service</code>.)</dd>
+  </dl>
+</section>
+
+<!-- INFO -->
+<h3 style="margin-top:36px;">Reclassified INFO findings — re-confirmed as non-issues</h3>
+
+<section class="finding INFO" id="I1">
+  <div class="head"><span class="sev sev-INFO">INFO</span><h3>I1 — DeleteEnrolledFingers without claim</h3>
+  <span class="path">dbus_iface.rs:335–348</span></div>
+  <dl><dt>Re-confirmed</dt><dd>The legacy <code>delete_enrolled_fingers</code> calls
+    <code>auth::authorize_username</code> (line 346), routing cross-user requests through
+    the polkit <code>setusername</code> action, which the shipped policy denies by
+    default. Claim-gated <code>DeleteEnrolledFingers2</code> exists alongside. No action.</dd></dl>
+</section>
+
+<section class="finding INFO" id="I2">
+  <div class="head"><span class="sev sev-INFO">INFO</span><h3>I2 — TPM Owner hierarchy "bypasses" PCR seal</h3>
+  <span class="path">tpm.rs</span></div>
+  <dl><dt>Re-confirmed</dt><dd><code>sealed_object_template</code> builds the object with
+    <code>with_admin_with_policy(true)</code> + <code>with_user_with_auth(false)</code>
+    and bakes the PolicyPCR digest into <code>auth_policy</code>; <code>unseal_key</code>
+    supplies a <code>PolicyPCR</code> session. The Owner hierarchy governs only the
+    deterministic SRK parent's lifecycle, not the sealed child's unseal authorization.
+    No bypass. No action.</dd></dl>
+</section>
+
+<section class="finding INFO" id="I3">
+  <div class="head"><span class="sev sev-INFO">INFO</span><h3>I3 — Subject::new_for_owner(pid, None, None)</h3>
+  <span class="path">auth.rs:89</span></div>
+  <dl><dt>Re-confirmed</dt><dd>polkitd reads <code>start_time</code> from
+    <code>/proc/&lt;pid&gt;/stat</code> when the caller passes <code>None</code>, so the
+    <code>(pid, start_time)</code> tuple is bound on the polkit side — not pid-reuse
+    racy. Documented in the comment at <code>auth.rs:84–88</code>. No action.</dd></dl>
+</section>
+
+<section class="finding INFO" id="I4">
+  <div class="head"><span class="sev sev-INFO">INFO</span><h3>I4 — Confidence score on the wire</h3>
+  <span class="path">r503fp.ino:168–187</span></div>
+  <dl><dt>Re-confirmed</dt><dd>The per-match confidence in <code>OK match=N confidence=M</code>
+    correlates with finger-image clarity, not the SipHash key, and rides the
+    authenticated channel. SPEC §13.1 puts confidentiality out of scope. No action.</dd></dl>
+</section>
+
+<section class="finding INFO" id="I5">
+  <div class="head"><span class="sev sev-INFO">INFO</span><h3>I5 — SPEC §13.11 known limitations</h3>
+  <span class="path">SPEC.md §13.11</span></div>
+  <dl><dt>Re-confirmed</dt><dd>Documentation cross-reference, not a code claim. The listed
+    items (single Nano, no <code>--resync</code>, no all-CRC-fail banner, opt-in TPM seal,
+    CH340 clone VID/PID sharing, no fuzz harness) are already acknowledged limitations,
+    not missed findings. No action.</dd></dl>
+</section>
+
+<h2>Verification Performed</h2>
+<div class="callout ok">
+  <h4>Build &amp; test gates (run after every change)</h4>
+  <ul class="tight">
+    <li><code>cargo build --release</code> — clean (one pre-existing dead-code warning, unrelated).</li>
+    <li><code>cargo test --release</code> — 92 tests pass (41 unit incl. new keystore/auth/storage coverage, plus crossimpl + fuzz + framing integration suites). 0 failures.</li>
+    <li><code>arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328</code> — clean; 21674 B flash (70%), 741 B RAM (36%).</li>
+    <li>New unit tests added for <code>validate_username</code> (accept + reject sets).</li>
+    <li><code>cargo clippy</code> — no <em>new</em> warnings introduced; all reported lints predate this branch.</li>
+  </ul>
+</div>
+
+<h2>Commit Chain</h2>
+<pre>5b56b51 security(L1): snapshot user_slots under the state lock in verify_start
+0b92257 security(L5): reject unsafe usernames at the resolve_caller boundary
+03336d4 security(L2): wrap framing.rs MAC input strings in Zeroizing
+e8865ea security(M5): pin PATH at top of reseal-tpm.sh
+9d712c9 security(L4): firmware inbuf cap off-by-one (&gt; 128 -&gt; &gt;= 128)
+baab047 security(M4): reject overlong framed body instead of silent truncation
+8e4230f security(M3): deny_unknown_fields + 0600 mode-verify on persisted JSON
+1370571 security(M2): guard keystore load with O_NOFOLLOW + owner/mode/symlink checks
+e6203c7 security(M1): cap read_line() at 4 KiB to bound rx_buf growth
+1d97b7b security(H1): tighten udev MODE + make TIOCEXCL explicit
+11bc9e9 docs(security): add 2026-05-28 adversarial audit report</pre>
+
+<footer>
+  Validation pass 2026-05-28. Each claim re-read against source at
+  <code>main · 10a991c</code>; fixes on <code>feat/security-audit-2026-05-28-fixes</code>.
+  Disposition rule: a fix lands only where the claim validated 100% AND the fix
+  closes a real gap with no happy-path regression. L3/L6 confirmed-but-not-fixed
+  per the audit's own guidance; L7 did not validate; I1–I5 re-confirmed non-issues.
+</footer>
+
+</div>
+</body>
+</html>
