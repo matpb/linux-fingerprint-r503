@@ -441,8 +441,10 @@ void loop() {
       inbuf += c;
       // v2 framed commands are ~80 chars max ("C <counter> <body> M <16-hex>").
       // 128 leaves comfortable headroom and matches the static `out` cap in
-      // LineFramer::flush_line.
-      if (inbuf.length() > 128) { Serial.println(F("ERR bad_args overflow")); inbuf = ""; }
+      // LineFramer::flush_line. Use >= so the documented "lines capped at 128
+      // bytes" invariant holds exactly — > 128 let a 129th byte land in inbuf
+      // before the check fired (audit 2026-05-28 / L4).
+      if (inbuf.length() >= 128) { Serial.println(F("ERR bad_args overflow")); inbuf = ""; }
     }
   }
 }
