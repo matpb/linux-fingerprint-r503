@@ -15,6 +15,7 @@
 
 use crate::crypto;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 const MAC_HEX_LEN: usize = 16;
 const MAC_SUFFIX_LEN: usize = 3 + MAC_HEX_LEN; // " M " + 16 hex
@@ -40,7 +41,11 @@ pub enum FramingError {
 // ---------- command frames ----------
 
 pub fn encode_command(key: &[u8; 16], counter: u64, cmd_line: &str) -> String {
-    let mac_input = format!("CMD {} {}", counter, cmd_line);
+    // Zeroizing: scrub the heap-allocated MAC input on drop. The input is
+    // public per the protocol (command text + counter), so this is hygiene/
+    // consistency with the rest of the key path, not a confidentiality fix
+    // (audit 2026-05-28 / L2).
+    let mac_input = Zeroizing::new(format!("CMD {} {}", counter, cmd_line));
     let mac = crypto::siphash24(key, mac_input.as_bytes());
     format!("C {} {} M {}", counter, cmd_line, crypto::mac_to_hex(mac))
 }
@@ -62,7 +67,7 @@ pub fn verify_command<'a>(
     line: &'a str,
 ) -> Result<(u64, &'a str), FramingError> {
     let (counter, cmd_line, claimed) = parse_command(line)?;
-    let mac_input = format!("CMD {} {}", counter, cmd_line);
+    let mac_input = Zeroizing::new(format!("CMD {} {}", counter, cmd_line));
     let expected = crypto::siphash24(key, mac_input.as_bytes());
     // `subtle::ConstantTimeEq` is the canonical constant-time equality on the
     // host side. The previous XOR + branch-on-zero was *intended* constant-
@@ -84,7 +89,7 @@ pub fn encode_response(
     seq: u32,
     body_line: &str,
 ) -> String {
-    let mac_input = format!("RSP {} {} {}", counter, seq, body_line);
+    let mac_input = Zeroizing::new(format!("RSP {} {} {}", counter, seq, body_line));
     let mac = crypto::siphash24(key, mac_input.as_bytes());
     format!(
         "R {} {} {} M {}",
@@ -116,7 +121,7 @@ pub fn verify_response<'a>(
     line: &'a str,
 ) -> Result<(u64, u32, &'a str), FramingError> {
     let (counter, seq, body, claimed) = parse_response(line)?;
-    let mac_input = format!("RSP {} {} {}", counter, seq, body);
+    let mac_input = Zeroizing::new(format!("RSP {} {} {}", counter, seq, body));
     let expected = crypto::siphash24(key, mac_input.as_bytes());
     // See `verify_command` for the `subtle::ConstantTimeEq` rationale.
     if !bool::from(expected.ct_eq(&claimed)) {
