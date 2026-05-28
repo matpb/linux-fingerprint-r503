@@ -20,10 +20,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
-use crate::dbus_iface::{Device, Manager, DEVICE_PATH, MANAGER_PATH};
+use crate::dbus_iface::{DEVICE_PATH, Device, MANAGER_PATH, Manager};
 use crate::sensor_actor::SensorActor;
 use crate::storage::Storage;
 
@@ -59,7 +59,7 @@ struct Args {
 
     /// One-shot: pair an unpaired Nano. Requires /etc/r503d/allow-pair (SPEC §13.5).
     /// Stop the daemon first: `systemctl stop r503d && r503d --pair`.
-    #[arg(long, conflicts_with_all = ["unpair", "status", "reseal_tpm"])]
+    #[arg(long, conflicts_with_all = ["unpair", "status", "reseal_tpm", "resync"])]
     pair: bool,
 
     /// With --pair: seal the generated key to the TPM (default PCR7).
@@ -78,18 +78,25 @@ struct Args {
     seal_tpm_pcrs: Option<String>,
 
     /// One-shot: wipe pairing from the Nano + host (key rotation / decommission).
-    #[arg(long, conflicts_with_all = ["pair", "status", "reseal_tpm"])]
+    #[arg(long, conflicts_with_all = ["pair", "status", "reseal_tpm", "resync"])]
     unpair: bool,
 
     /// One-shot: print pairing state from both sides without mutating.
-    #[arg(long, conflicts_with_all = ["pair", "unpair", "reseal_tpm"])]
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "reseal_tpm", "resync"])]
     status: bool,
+
+    /// One-shot: recover a lost/rolled-back state.json without re-pairing.
+    /// Reads the Nano's last_seen counter and sets the host's next counter to
+    /// last_seen+1. Requires the host key to still exist. Stop the daemon
+    /// first: `systemctl stop r503d && r503d --resync` (SPEC §13.11).
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "status", "reseal_tpm"])]
+    resync: bool,
 
     /// One-shot: recover from a PCR7 policy change (kernel update, Secure Boot
     /// edit, hardware move). Assumes the Nano EEPROM has been externally wiped
     /// — the wrapper script `dist/reseal-tpm.sh` handles that. Re-pairs the
     /// Nano with a fresh key and seals it to current PCR7.
-    #[arg(long, conflicts_with_all = ["pair", "unpair", "status"])]
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "status", "resync"])]
     reseal_tpm: bool,
 }
 
@@ -135,11 +142,11 @@ async fn main() -> anyhow::Result<()> {
     if args.unpair {
         return pairing::run_unpair(args.port.as_deref());
     }
+    if args.resync {
+        return pairing::run_resync(args.port.as_deref());
+    }
     if args.reseal_tpm {
-        return pairing::run_reseal_tpm(
-            args.port.as_deref(),
-            args.seal_tpm_pcrs.as_deref(),
-        );
+        return pairing::run_reseal_tpm(args.port.as_deref(), args.seal_tpm_pcrs.as_deref());
     }
 
     let storage_path = args

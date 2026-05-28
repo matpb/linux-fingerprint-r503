@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, OnceCell};
+use tokio::sync::{OnceCell, mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use crate::sensor::{MatchResult, R503, SensorError, SensorInfo};
@@ -245,7 +245,11 @@ impl SensorActor {
         match open_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(anyhow::anyhow!("sensor open failed: {}", e)),
-            Err(_) => return Err(anyhow::anyhow!("sensor worker dropped before signalling open")),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "sensor worker dropped before signalling open"
+                ));
+            }
         }
 
         let actor = SensorActor {
@@ -253,7 +257,10 @@ impl SensorActor {
             initial_info: Arc::new(OnceCell::new()),
         };
         // Probe info once for capacity etc.
-        let info = actor.info().await.map_err(|e| anyhow::anyhow!("initial info failed: {}", e))?;
+        let info = actor
+            .info()
+            .await
+            .map_err(|e| anyhow::anyhow!("initial info failed: {}", e))?;
         actor.initial_info.set(info).ok();
         Ok(actor)
     }
@@ -283,7 +290,11 @@ impl SensorActor {
                 let _ = done.send(result);
                 HandleOutcome::Done
             }
-            SensorRequest::Enroll { slot, progress, done } => {
+            SensorRequest::Enroll {
+                slot,
+                progress,
+                done,
+            } => {
                 install_progress(sensor, &progress);
                 let result = sensor.enroll(slot);
                 let fatal = matches!(&result, Err(e) if is_fatal_io(e));
@@ -304,10 +315,7 @@ impl SensorActor {
                 install_progress(sensor, &progress);
                 let result = sensor.verify();
                 if matches!(&result, Err(e) if is_fatal_io(e)) {
-                    return HandleOutcome::NeedsReopen(SensorRequest::Verify {
-                        progress,
-                        done,
-                    });
+                    return HandleOutcome::NeedsReopen(SensorRequest::Verify { progress, done });
                 }
                 let _ = done.send(result);
                 HandleOutcome::Done
@@ -316,10 +324,7 @@ impl SensorActor {
                 install_progress(sensor, &progress);
                 let result = sensor.identify();
                 if matches!(&result, Err(e) if is_fatal_io(e)) {
-                    return HandleOutcome::NeedsReopen(SensorRequest::Identify {
-                        progress,
-                        done,
-                    });
+                    return HandleOutcome::NeedsReopen(SensorRequest::Identify { progress, done });
                 }
                 let _ = done.send(result);
                 HandleOutcome::Done
@@ -427,59 +432,108 @@ impl SensorActor {
     pub async fn info(&self) -> Result<SensorInfo, SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::Info(tx))?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     pub async fn enroll(&self, slot: u8, progress: Option<ProgressTx>) -> Result<u8, SensorError> {
         let (tx, rx) = oneshot::channel();
-        self.send(SensorRequest::Enroll { slot, progress, done: tx })?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        self.send(SensorRequest::Enroll {
+            slot,
+            progress,
+            done: tx,
+        })?;
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     pub async fn verify(&self, progress: Option<ProgressTx>) -> Result<MatchResult, SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::Verify { progress, done: tx })?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     #[allow(dead_code)]
     pub async fn identify(&self, progress: Option<ProgressTx>) -> Result<MatchResult, SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::Identify { progress, done: tx })?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     pub async fn delete(&self, slot: u8) -> Result<u8, SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::Delete { slot, done: tx })?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     #[allow(dead_code)]
     pub async fn clear(&self) -> Result<(), SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::Clear(tx))?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     #[allow(dead_code)]
     pub async fn wake(&self) -> Result<bool, SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::Wake(tx))?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     #[allow(dead_code)]
     pub async fn ping(&self) -> Result<bool, SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::Ping(tx))?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 
     #[allow(dead_code)]
     pub async fn led_off(&self) -> Result<(), SensorError> {
         let (tx, rx) = oneshot::channel();
         self.send(SensorRequest::LedOff(tx))?;
-        rx.await.map_err(|_| SensorError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sensor worker gone")))?
+        rx.await.map_err(|_| {
+            SensorError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sensor worker gone",
+            ))
+        })?
     }
 }

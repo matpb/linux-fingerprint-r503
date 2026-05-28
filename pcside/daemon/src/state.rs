@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -31,7 +31,9 @@ impl State {
     pub fn fresh() -> Self {
         // Nano accepts any C > last_seen, where last_seen starts at 0 after
         // pairing. Starting next_cmd_counter at 1 keeps the wire human-readable.
-        Self { next_cmd_counter: 1 }
+        Self {
+            next_cmd_counter: 1,
+        }
     }
 }
 
@@ -53,10 +55,9 @@ pub fn load() -> Result<Option<State>> {
     if mode != 0o600 {
         bail!("insecure mode {:o} on {} (expected 0600)", mode, STATE_PATH);
     }
-    let bytes = fs::read(STATE_PATH)
-        .with_context(|| format!("reading {}", STATE_PATH))?;
-    let state: State = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing {}", STATE_PATH))?;
+    let bytes = fs::read(STATE_PATH).with_context(|| format!("reading {}", STATE_PATH))?;
+    let state: State =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", STATE_PATH))?;
     Ok(Some(state))
 }
 
@@ -79,8 +80,7 @@ pub fn save(state: &State) -> Result<()> {
         f.write_all(b"\n")?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, STATE_PATH)
-        .with_context(|| format!("renaming {} → {}", tmp, STATE_PATH))?;
+    fs::rename(&tmp, STATE_PATH).with_context(|| format!("renaming {} → {}", tmp, STATE_PATH))?;
     Ok(())
 }
 
@@ -103,7 +103,9 @@ mod tests {
 
     #[test]
     fn round_trip_serde() {
-        let s = State { next_cmd_counter: 42 };
+        let s = State {
+            next_cmd_counter: 42,
+        };
         let j = serde_json::to_string(&s).unwrap();
         let back: State = serde_json::from_str(&j).unwrap();
         assert_eq!(back.next_cmd_counter, 42);

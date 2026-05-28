@@ -14,7 +14,7 @@ use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use r503d::framing;
 use serialport::SerialPort;
 
@@ -41,7 +41,10 @@ impl Link {
             .timeout(Duration::from_millis(200))
             .open()
             .with_context(|| format!("opening {}", path))?;
-        let mut link = Link { port, rx: Vec::new() };
+        let mut link = Link {
+            port,
+            rx: Vec::new(),
+        };
         // Boot takes ~2.5s (setup() + delay(500) + finger.begin() + emitInfo()).
         // After that the Nano is in its main loop. Some opens trigger DTR reset
         // (cold), some don't (warm); cover both by retrying ping until we hear
@@ -56,10 +59,15 @@ impl Link {
             let per_attempt = Instant::now() + Duration::from_millis(800);
             loop {
                 let remaining = per_attempt.saturating_duration_since(Instant::now());
-                if remaining.is_zero() { break; }
+                if remaining.is_zero() {
+                    break;
+                }
                 match link.read_line(remaining)? {
                     Some(line) if line == "OK pong" => return Ok(link),
-                    Some(line) => { last = Some(line); continue; }
+                    Some(line) => {
+                        last = Some(line);
+                        continue;
+                    }
                     None => break,
                 }
             }
@@ -101,9 +109,7 @@ impl Link {
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            self.port
-                .set_timeout(Duration::from_millis(100))
-                .ok();
+            self.port.set_timeout(Duration::from_millis(100)).ok();
             let mut buf = [0u8; 256];
             match self.port.read(&mut buf) {
                 Ok(0) => {}
@@ -167,7 +173,10 @@ fn main() -> Result<()> {
         let want = format!("OK counter={} inner={}", ctr, cmd);
         let ok = reply == want;
         let flag = if ok { "OK " } else { "BAD" };
-        eprintln!("[t1/{:2}] {} ctr={} cmd={:?}\n        reply: {}", i, flag, ctr, cmd, reply);
+        eprintln!(
+            "[t1/{:2}] {} ctr={} cmd={:?}\n        reply: {}",
+            i, flag, ctr, cmd, reply
+        );
         if !ok {
             eprintln!("        want : {}", want);
             fails += 1;
@@ -189,7 +198,10 @@ fn main() -> Result<()> {
         let req = format!("frame_resp {} {} {} {}", key_hex(&t2_key), ctr, seq, body);
         let reply = link.cmd(&req, Duration::from_millis(500))?;
         let Some(frame) = reply.strip_prefix("OK frame=") else {
-            eprintln!("[t2/{:2}] BAD ctr={} seq={} body={:?}\n        unexpected reply: {}", i, ctr, seq, body, reply);
+            eprintln!(
+                "[t2/{:2}] BAD ctr={} seq={} body={:?}\n        unexpected reply: {}",
+                i, ctr, seq, body, reply
+            );
             fails += 1;
             continue;
         };
@@ -197,14 +209,23 @@ fn main() -> Result<()> {
             Ok((got_ctr, got_seq, got_body)) => {
                 let ok = got_ctr == *ctr && got_seq == *seq && got_body == *body;
                 let flag = if ok { "OK " } else { "BAD" };
-                eprintln!("[t2/{:2}] {} ctr={} seq={} body={:?}", i, flag, ctr, seq, body);
+                eprintln!(
+                    "[t2/{:2}] {} ctr={} seq={} body={:?}",
+                    i, flag, ctr, seq, body
+                );
                 if !ok {
-                    eprintln!("        got ctr={} seq={} body={:?}", got_ctr, got_seq, got_body);
+                    eprintln!(
+                        "        got ctr={} seq={} body={:?}",
+                        got_ctr, got_seq, got_body
+                    );
                     fails += 1;
                 }
             }
             Err(e) => {
-                eprintln!("[t2/{:2}] BAD verify failed: {:?}\n        frame: {}", i, e, frame);
+                eprintln!(
+                    "[t2/{:2}] BAD verify failed: {:?}\n        frame: {}",
+                    i, e, frame
+                );
                 fails += 1;
             }
         }
@@ -226,7 +247,7 @@ fn main() -> Result<()> {
     // Wrong key: encode with a different key, send for verification under t3_key.
     let wrong_key_frame = framing::encode_command(&rand_key(), 100, "verify 5");
 
-    let t3_cases = vec![
+    let t3_cases = [
         ("tampered body", tampered_body),
         ("tampered counter", tampered_counter),
         ("tampered mac", tampered_mac),

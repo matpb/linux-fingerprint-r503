@@ -62,10 +62,7 @@ pub fn parse_command(line: &str) -> Result<(u64, &str, u64), FramingError> {
 }
 
 /// Parse + MAC-verify a command frame. Returns (counter, cmd_line).
-pub fn verify_command<'a>(
-    key: &[u8; 16],
-    line: &'a str,
-) -> Result<(u64, &'a str), FramingError> {
+pub fn verify_command<'a>(key: &[u8; 16], line: &'a str) -> Result<(u64, &'a str), FramingError> {
     let (counter, cmd_line, claimed) = parse_command(line)?;
     let mac_input = Zeroizing::new(format!("CMD {} {}", counter, cmd_line));
     let expected = crypto::siphash24(key, mac_input.as_bytes());
@@ -83,12 +80,7 @@ pub fn verify_command<'a>(
 
 // ---------- response frames ----------
 
-pub fn encode_response(
-    key: &[u8; 16],
-    counter: u64,
-    seq: u32,
-    body_line: &str,
-) -> String {
+pub fn encode_response(key: &[u8; 16], counter: u64, seq: u32, body_line: &str) -> String {
     let mac_input = Zeroizing::new(format!("RSP {} {} {}", counter, seq, body_line));
     let mac = crypto::siphash24(key, mac_input.as_bytes());
     format!(
@@ -169,17 +161,27 @@ fn split_counter_body(s: &str) -> Result<(u64, &str), FramingError> {
 /// strict parser removes the surface entirely.
 fn parse_strict_u64(s: &str) -> Option<u64> {
     let b = s.as_bytes();
-    if b.is_empty() { return None; }
-    if b.len() > 1 && b[0] == b'0' { return None; }
+    if b.is_empty() {
+        return None;
+    }
+    if b.len() > 1 && b[0] == b'0' {
+        return None;
+    }
     for &c in b {
-        if !c.is_ascii_digit() { return None; }
+        if !c.is_ascii_digit() {
+            return None;
+        }
     }
     s.parse().ok()
 }
 
 fn parse_strict_u32(s: &str) -> Option<u32> {
     let v = parse_strict_u64(s)?;
-    if v > u32::MAX as u64 { None } else { Some(v as u32) }
+    if v > u32::MAX as u64 {
+        None
+    } else {
+        Some(v as u32)
+    }
 }
 
 fn parse_mac_hex(hex: &str) -> Result<u64, FramingError> {
@@ -212,8 +214,8 @@ mod tests {
     use super::*;
 
     const K: [u8; 16] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
     ];
 
     #[test]

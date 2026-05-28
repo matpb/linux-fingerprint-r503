@@ -15,16 +15,17 @@
 //! that would defeat the point.
 
 #![allow(dead_code)] // sealed_blob_exists / current_pcr7_hex / hex_encode are
-                     // wired in via follow-up tooling (--tpm-info CLI etc.);
-                     // keeping them here saves a churn pass when those land.
+// wired in via follow-up tooling (--tpm-info CLI etc.);
+// keeping them here saves a churn pass when those land.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::path::Path;
 use zeroize::Zeroizing;
 
 use std::str::FromStr;
 
 use tss_esapi::{
+    Context as TpmContext,
     attributes::{ObjectAttributesBuilder, SessionAttributesBuilder},
     constants::SessionType,
     handles::SessionHandle,
@@ -42,7 +43,6 @@ use tss_esapi::{
     tcti_ldr::{DeviceConfig, TctiNameConf},
     traits::{Marshall, UnMarshall},
     utils::create_restricted_decryption_rsa_public,
-    Context as TpmContext,
 };
 
 pub const TPM_DEVICE: &str = "/dev/tpmrm0";
@@ -99,14 +99,7 @@ pub fn seal_key_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<Vec<u8>> {
     let attempt: Result<(Vec<u8>, Vec<u8>)> = (|| {
         ctx.set_sessions((Some(hmac), None, None));
         let primary = ctx
-            .create_primary(
-                Hierarchy::Owner,
-                srk_template()?,
-                None,
-                None,
-                None,
-                None,
-            )
+            .create_primary(Hierarchy::Owner, srk_template()?, None, None, None, None)
             .context("creating primary key on Owner hierarchy")?;
 
         let sealed_pub = sealed_object_template(policy_digest.clone())?;
@@ -115,7 +108,14 @@ pub fn seal_key_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<Vec<u8>> {
             .map_err(|e| anyhow!("wrapping 16 bytes into SensitiveData: {:?}", e))?;
 
         let created = ctx
-            .create(primary.key_handle, sealed_pub, None, Some(sensitive), None, None)
+            .create(
+                primary.key_handle,
+                sealed_pub,
+                None,
+                Some(sensitive),
+                None,
+                None,
+            )
             .context("creating sealed object under primary")?;
 
         let pub_bytes: Vec<u8> = created
@@ -159,14 +159,7 @@ pub fn unseal_key(blob: &[u8]) -> Result<Zeroizing<[u8; 16]>> {
     let attempt: Result<Zeroizing<[u8; 16]>> = (|| {
         ctx.set_sessions((Some(hmac), None, None));
         let primary = ctx
-            .create_primary(
-                Hierarchy::Owner,
-                srk_template()?,
-                None,
-                None,
-                None,
-                None,
-            )
+            .create_primary(Hierarchy::Owner, srk_template()?, None, None, None, None)
             .context("re-creating primary key (TPM owner seed mismatch?)")?;
 
         let loaded = ctx
@@ -217,9 +210,7 @@ pub fn unseal_key(blob: &[u8]) -> Result<Zeroizing<[u8; 16]>> {
 pub fn current_pcr7_hex() -> Result<String> {
     let mut ctx = open_context()?;
     let pcr_sel = pcr_selection_for(DEFAULT_PCRS)?;
-    let (_count, _sel, digests) = ctx
-        .pcr_read(pcr_sel)
-        .context("pcr_read on PCR7")?;
+    let (_count, _sel, digests) = ctx.pcr_read(pcr_sel).context("pcr_read on PCR7")?;
     let d = digests
         .value()
         .first()
@@ -233,8 +224,11 @@ pub fn parse_pcr_list(s: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for tok in s.split(',') {
         let tok = tok.trim();
-        if tok.is_empty() { continue; }
-        let n: u8 = tok.parse()
+        if tok.is_empty() {
+            continue;
+        }
+        let n: u8 = tok
+            .parse()
             .with_context(|| format!("PCR index {:?} is not a u8", tok))?;
         out.push(n);
     }
@@ -250,7 +244,10 @@ fn validate_pcrs(pcrs: &[u8]) -> Result<()> {
         bail!("PCR list cannot be empty");
     }
     if pcrs.len() > 24 {
-        bail!("PCR list too long ({} > 24 slots in the SHA256 bank)", pcrs.len());
+        bail!(
+            "PCR list too long ({} > 24 slots in the SHA256 bank)",
+            pcrs.len()
+        );
     }
     for &p in pcrs {
         if p > 23 {
@@ -290,18 +287,30 @@ fn pcr_selection_for(pcrs: &[u8]) -> Result<PcrSelectionList> {
 
 fn u8_to_pcr_slot(p: u8) -> PcrSlot {
     match p {
-        0 => PcrSlot::Slot0,    1 => PcrSlot::Slot1,
-        2 => PcrSlot::Slot2,    3 => PcrSlot::Slot3,
-        4 => PcrSlot::Slot4,    5 => PcrSlot::Slot5,
-        6 => PcrSlot::Slot6,    7 => PcrSlot::Slot7,
-        8 => PcrSlot::Slot8,    9 => PcrSlot::Slot9,
-        10 => PcrSlot::Slot10, 11 => PcrSlot::Slot11,
-        12 => PcrSlot::Slot12, 13 => PcrSlot::Slot13,
-        14 => PcrSlot::Slot14, 15 => PcrSlot::Slot15,
-        16 => PcrSlot::Slot16, 17 => PcrSlot::Slot17,
-        18 => PcrSlot::Slot18, 19 => PcrSlot::Slot19,
-        20 => PcrSlot::Slot20, 21 => PcrSlot::Slot21,
-        22 => PcrSlot::Slot22, 23 => PcrSlot::Slot23,
+        0 => PcrSlot::Slot0,
+        1 => PcrSlot::Slot1,
+        2 => PcrSlot::Slot2,
+        3 => PcrSlot::Slot3,
+        4 => PcrSlot::Slot4,
+        5 => PcrSlot::Slot5,
+        6 => PcrSlot::Slot6,
+        7 => PcrSlot::Slot7,
+        8 => PcrSlot::Slot8,
+        9 => PcrSlot::Slot9,
+        10 => PcrSlot::Slot10,
+        11 => PcrSlot::Slot11,
+        12 => PcrSlot::Slot12,
+        13 => PcrSlot::Slot13,
+        14 => PcrSlot::Slot14,
+        15 => PcrSlot::Slot15,
+        16 => PcrSlot::Slot16,
+        17 => PcrSlot::Slot17,
+        18 => PcrSlot::Slot18,
+        19 => PcrSlot::Slot19,
+        20 => PcrSlot::Slot20,
+        21 => PcrSlot::Slot21,
+        22 => PcrSlot::Slot22,
+        23 => PcrSlot::Slot23,
         // validate_pcrs() screens this out before we get here.
         _ => unreachable!("PCR {} > 23 should have been rejected", p),
     }
@@ -351,10 +360,7 @@ fn start_policy_session(ctx: &mut TpmContext) -> Result<AuthSession> {
 
 /// Run PolicyPCR on a trial session to compute the policy digest we'll bake
 /// into the sealed object's `auth_policy` field.
-fn trial_policy_pcr_digest(
-    ctx: &mut TpmContext,
-    pcr_sel: PcrSelectionList,
-) -> Result<Digest> {
+fn trial_policy_pcr_digest(ctx: &mut TpmContext, pcr_sel: PcrSelectionList) -> Result<Digest> {
     let old = ctx.sessions();
     ctx.clear_sessions();
 
@@ -438,8 +444,11 @@ fn serialize_blob(pcrs: &[u8], pub_bytes: &[u8], priv_bytes: &[u8]) -> Vec<u8> {
     // round-tripping. Anything else gets the v2 magic + explicit PCR list.
     let use_v2 = pcrs != DEFAULT_PCRS;
     let mut out = Vec::with_capacity(
-        FILE_MAGIC_V1.len() + 8 + pub_bytes.len() + priv_bytes.len()
-            + if use_v2 { 1 + pcrs.len() } else { 0 }
+        FILE_MAGIC_V1.len()
+            + 8
+            + pub_bytes.len()
+            + priv_bytes.len()
+            + if use_v2 { 1 + pcrs.len() } else { 0 },
     );
     out.extend_from_slice(if use_v2 { FILE_MAGIC_V2 } else { FILE_MAGIC_V1 });
     if use_v2 {
@@ -467,7 +476,9 @@ fn deserialize_blob(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         (DEFAULT_PCRS.to_vec(), FILE_MAGIC_V1.len())
     } else if &blob[..FILE_MAGIC_V2.len()] == FILE_MAGIC_V2 {
         let mut off = FILE_MAGIC_V2.len();
-        if off >= blob.len() { bail!("v2 sealed blob truncated before pcr_count"); }
+        if off >= blob.len() {
+            bail!("v2 sealed blob truncated before pcr_count");
+        }
         let pcr_count = blob[off] as usize;
         off += 1;
         if pcr_count == 0 || pcr_count > 24 {
@@ -484,10 +495,13 @@ fn deserialize_blob(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         bail!("sealed blob magic mismatch — file isn't a key.tpm produced by this daemon");
     };
 
-    let pub_len =
-        u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
+    let pub_len = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
     if pub_len > MAX_FIELD {
-        bail!("sealed blob pub field too large ({} > {})", pub_len, MAX_FIELD);
+        bail!(
+            "sealed blob pub field too large ({} > {})",
+            pub_len,
+            MAX_FIELD
+        );
     }
     off += 4;
     let pub_end = off
@@ -499,10 +513,13 @@ fn deserialize_blob(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     }
     let pub_bytes = blob[off..off + pub_len].to_vec();
     off += pub_len;
-    let priv_len =
-        u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
+    let priv_len = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
     if priv_len > MAX_FIELD {
-        bail!("sealed blob priv field too large ({} > {})", priv_len, MAX_FIELD);
+        bail!(
+            "sealed blob priv field too large ({} > {})",
+            priv_len,
+            MAX_FIELD
+        );
     }
     off += 4;
     let blob_end = off
@@ -536,8 +553,11 @@ mod tests {
         let pub_bytes = vec![1, 2, 3, 4, 5];
         let priv_bytes = vec![9, 8, 7];
         let blob = serialize_blob(DEFAULT_PCRS, &pub_bytes, &priv_bytes);
-        assert_eq!(&blob[..FILE_MAGIC_V1.len()], FILE_MAGIC_V1,
-            "default PCRs should still use v1 magic for backward compat");
+        assert_eq!(
+            &blob[..FILE_MAGIC_V1.len()],
+            FILE_MAGIC_V1,
+            "default PCRs should still use v1 magic for backward compat"
+        );
         let (pcrs, p, q) = deserialize_blob(&blob).unwrap();
         assert_eq!(pcrs, DEFAULT_PCRS);
         assert_eq!(p, pub_bytes);
@@ -550,8 +570,11 @@ mod tests {
         let pub_bytes = vec![1, 2, 3, 4, 5];
         let priv_bytes = vec![9, 8, 7];
         let blob = serialize_blob(&pcrs, &pub_bytes, &priv_bytes);
-        assert_eq!(&blob[..FILE_MAGIC_V2.len()], FILE_MAGIC_V2,
-            "non-default PCRs should use v2 magic");
+        assert_eq!(
+            &blob[..FILE_MAGIC_V2.len()],
+            FILE_MAGIC_V2,
+            "non-default PCRs should use v2 magic"
+        );
         let (got_pcrs, p, q) = deserialize_blob(&blob).unwrap();
         assert_eq!(got_pcrs, pcrs);
         assert_eq!(p, pub_bytes);
@@ -610,9 +633,9 @@ mod tests {
     #[test]
     fn parse_pcr_list_rejects_invalid() {
         assert!(parse_pcr_list("").is_err());
-        assert!(parse_pcr_list("24").is_err());      // out of range
-        assert!(parse_pcr_list("7,7").is_err());     // duplicate
-        assert!(parse_pcr_list("seven").is_err());   // non-numeric
-        assert!(parse_pcr_list("-1").is_err());      // negative
+        assert!(parse_pcr_list("24").is_err()); // out of range
+        assert!(parse_pcr_list("7,7").is_err()); // duplicate
+        assert!(parse_pcr_list("seven").is_err()); // non-numeric
+        assert!(parse_pcr_list("-1").is_err()); // negative
     }
 }

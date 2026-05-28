@@ -525,7 +525,7 @@ The 64-bit counter itself wraps in geological time; not a concern.
 | Daemon-side MAC mismatch on response | Daemon's `verify_response` fails | Daemon errors the in-flight call; logged | Caller (pam_fprintd) typically retries once |
 | Daemon-side counter or seq mismatch | Daemon checks `R <ctr> <seq>` vs expected | Same | Same |
 | Host key file lost (no backup) | Daemon start: `keystore::load_key()` returns None on a paired Nano | Daemon proceeds in unframed mode, all commands fail with `mac_required` from firmware; PAM sees errors | Reflash-to-wipe + re-pair (§13.5) |
-| Host state.json lost | Daemon start: `state::load()` returns Ok(None) | Daemon defaults to `next_cmd_counter = 1`. On first send, firmware accepts if `1 > last_seen`; otherwise `ERR replay` | If replay-rejected, currently no automatic resync — wipe and re-pair. (`r503d --resync` is on the roadmap, §13.11.) |
+| Host state.json lost | Daemon start: `state::load()` returns Ok(None) | Daemon defaults to `next_cmd_counter = 1`. On first send, firmware accepts if `1 > last_seen`; otherwise `ERR replay` | Run `r503d --resync`: reads the Nano's `last_seen` from a `status` query and sets the host counter to `last_seen + 1`, no re-pair needed. `--status` prints a hint when it detects this state. |
 | Nano EEPROM ring all-CRC-fail (extreme bit-rot or fresh chip without prior pairing) | Firmware scan returns `any_valid=false` | `last_seen` reads as 0; daemon's counter > 0 will be accepted | Self-healing on first successful command |
 | R503 sensor doesn't respond on first `info` after boot | Firmware: `finger.verifyPassword()` returns false | Framed `ERR sensor_unreachable` | Daemon retries; usually transient (SoftwareSerial timing on cold boot) |
 | Inbound line exceeds 4096 bytes with no newline (glitchy firmware, or a co-opener that slipped past the exclusive lock) | Daemon: `read_line` cap | `SensorError::Protocol` after clearing the RX buffer + flushing the kernel input queue | Caller decides to retry or fail; bounds RAM growth (2026-05-28 audit / M1) |
@@ -550,7 +550,8 @@ The 64-bit counter itself wraps in geological time; not a concern.
 - Atomic state file writes.
 - Wear-leveled counter ring with CRC-16 integrity.
 - Reflash-to-wipe sketch (`firmware/r503fp_wipe/`).
-- `r503d --pair / --unpair / --status` CLI surface.
+- `r503d --pair / --unpair / --status / --resync` CLI surface.
+- `r503d --resync`: recover a lost/rolled-back `state.json` without re-pairing — reads the Nano's `last_seen` from a `status` query and sets the host counter to `last_seen + 1` (`pairing::run_resync`). `--status` prints a hint when it detects paired-with-key-but-no-state.
 - USB unplug/replug recovery: `SensorActor` reopens the port, re-applies auth (key + counter reloaded from state.json), continues. Tested implicitly during dev.
 - 2026-05-28 adversarial-audit hardening: root-only `/dev/r503` + explicit exclusive open (H1), bounded `read_line` (M1), `O_NOFOLLOW`/owner/mode guards on key load (M2), `deny_unknown_fields` + `0600` mode-verify on JSON load (M3), firmware body-length reject (M4), pinned `PATH` in `reseal-tpm.sh` (M5), plus the LOW-severity hygiene items. One commit per validated finding; see the validation report.
 
@@ -575,7 +576,6 @@ The 64-bit counter itself wraps in geological time; not a concern.
 **Footprint on the Nano (`fw=1.0`):** 70% of flash (21,674 / 30,720 bytes), 36% of SRAM (741 / 2,048 bytes) — measured with `arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328` after the 2026-05-28 audit hardening (the body-length reject of finding M4 added the handful of bytes over the original ~21,290).
 
 **Not implemented, on the roadmap (§13.11):**
-- `r503d --resync` for state.json loss recovery.
 - `degraded=true` banner field for EEPROM-ring-all-corrupted edge case.
 - Round-trip latency measurement (claimed budget was <10 ms vs v1 baseline; not actually benchmarked).
 
@@ -612,7 +612,7 @@ The 64-bit counter itself wraps in geological time; not a concern.
 ### 13.11 Known limitations and future work
 
 - **Single Nano = single point of failure.** If the Nano dies, login via this path is gone until you reflash a spare. Keep a second authentication method enabled (password). The R503 templates live on the sensor itself, so if you transplant the R503 onto a fresh Nano you'd still need to enroll all fingers again unless you transferred the EEPROM somehow.
-- **No `r503d --resync`.** If `state.json` is lost while the firmware still has a high `last_seen`, the daemon will hit `ERR replay` on its first send and need a manual wipe-and-re-pair. The fix is a CLI subcommand that reads `last_seen` from a framed `status` (which already returns it) and sets the local counter to `last_seen + 1`. Easy; just not implemented.
+- **State.json loss is recoverable without re-pairing.** If `state.json` is lost or rolled back while the firmware still has a high `last_seen`, the daemon hits `ERR replay` on its first send. Recovery is `r503d --resync`: it reads `last_seen` from a `status` query and sets the local counter to `last_seen + 1`. The `status` reply is unauthenticated, but resync can only move the host counter *forward* to match what the Nano already committed — a lying MITM can at worst cause a self-inflicted `ERR replay` (which it could already do by garbling frames), never make an old frame replayable. (`pairing::run_resync`; `--status` hints when it detects the paired-but-no-state condition.)
 - **No `degraded=true` banner.** The EEPROM all-CRC-fail edge case currently silently degrades to `last_seen = 0`. Should expose this via the boot banner so the daemon can refuse to operate instead of accepting whatever the host sends.
 - **Hand-rolled SipHash, no paid third-party audit.** The implementations are short, KAT-verified against published Aumasson vectors, cross-validated against the third-party `siphasher` crate on 1024 random vectors (`pcside/daemon/tests/crossimpl_siphash.rs`), and the firmware runs a boot-time on-device KAT self-test that halts the channel if the primitive diverges. A paid external audit would still catch things this combined evidence doesn't. PRs from people who do this professionally are welcome.
 - **TPM seal is opt-in, not default.** Hosts without a TPM2 device, or hosts where the operator hasn't run `--pair --seal-tpm`, still keep the key as plaintext on disk per §13.6. Defaulting on once the TPM path has more bake-in is on the roadmap.

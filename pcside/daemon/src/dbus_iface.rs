@@ -95,7 +95,11 @@ async fn delete_user_fingers(
     }
     for finger in &succeeded {
         if let Err(e) = storage.remove_finger(user, finger).await {
-            tracing::warn!("registry remove {} failed after sensor delete: {}", finger, e);
+            tracing::warn!(
+                "registry remove {} failed after sensor delete: {}",
+                finger,
+                e
+            );
             errors.push(format!("{} (registry write): {}", finger, e));
         }
     }
@@ -245,12 +249,12 @@ impl Device {
             .claimed_by
             .as_ref()
             .ok_or_else(|| FprintError::ClaimDevice("device not claimed".into()))?;
-        if let (Some(s), Some(claim_s)) = (sender, state.claim_sender.as_deref()) {
-            if s != claim_s {
-                return Err(FprintError::ClaimDevice(
-                    "device claimed by a different sender".into(),
-                ));
-            }
+        if let (Some(s), Some(claim_s)) = (sender, state.claim_sender.as_deref())
+            && s != claim_s
+        {
+            return Err(FprintError::ClaimDevice(
+                "device claimed by a different sender".into(),
+            ));
         }
         Ok(user.clone())
     }
@@ -370,10 +374,7 @@ impl Device {
             .get_slot(&user, &finger_name)
             .await
             .ok_or_else(|| {
-                FprintError::NoEnrolledPrints(format!(
-                    "{} not enrolled for {}",
-                    finger_name, user
-                ))
+                FprintError::NoEnrolledPrints(format!("{} not enrolled for {}", finger_name, user))
             })?;
         if let Err(e) = self.sensor.delete(slot).await {
             tracing::warn!("sensor delete slot {} failed: {}", slot, e);
@@ -399,8 +400,7 @@ impl Device {
         // the binding for free via `ensure_claim`. Pre-fix, a local user
         // could `Claim "root"` and then enroll their own finger under root's
         // identity (SECURITY_HARDENING_PLAN.md §P0-1).
-        let user =
-            crate::auth::authorize_username(conn, sender.as_deref(), &username).await?;
+        let user = crate::auth::authorize_username(conn, sender.as_deref(), &username).await?;
         let mut state = self.state.lock().await;
         // Single-user pragma: if the device is already claimed for the SAME
         // user and no operation is in flight, allow the new caller to take
@@ -416,10 +416,10 @@ impl Device {
                     existing
                 )));
             }
-            if state.action.is_some() {
+            if let Some(action) = state.action {
                 return Err(FprintError::AlreadyInUse(format!(
                     "{} in progress for {}",
-                    state.action.unwrap().kind.as_str(),
+                    action.kind.as_str(),
                     existing
                 )));
             }
@@ -441,12 +441,12 @@ impl Device {
         if state.claimed_by.is_none() {
             return Err(FprintError::ClaimDevice("device not claimed".into()));
         }
-        if let (Some(s), Some(claim_s)) = (sender.as_deref(), state.claim_sender.as_deref()) {
-            if s != claim_s {
-                return Err(FprintError::ClaimDevice(
-                    "claimed by a different sender".into(),
-                ));
-            }
+        if let (Some(s), Some(claim_s)) = (sender.as_deref(), state.claim_sender.as_deref())
+            && s != claim_s
+        {
+            return Err(FprintError::ClaimDevice(
+                "claimed by a different sender".into(),
+            ));
         }
         tracing::info!(user = ?state.claimed_by, "Device released");
         state.claimed_by = None;
@@ -519,7 +519,9 @@ impl Device {
         };
 
         tracing::info!(user = %user, selected = %selected, expected = ?expected_slots, "VerifyStart");
-        Device::verify_finger_selected(&emitter, &selected).await.ok();
+        Device::verify_finger_selected(&emitter, &selected)
+            .await
+            .ok();
         {
             let mut state = self.state.lock().await;
             state.finger_needed = true;
@@ -566,9 +568,12 @@ impl Device {
                 };
                 match result {
                     Ok(MatchResult { slot, confidence }) => {
-                        let accepted = expected_slots.contains(&slot)
-                            && confidence >= threshold;
-                        let status = if accepted { "verify-match" } else { "verify-no-match" };
+                        let accepted = expected_slots.contains(&slot) && confidence >= threshold;
+                        let status = if accepted {
+                            "verify-match"
+                        } else {
+                            "verify-no-match"
+                        };
                         tracing::info!(slot, confidence, accepted, "verify done");
                         break 'outer Some(status);
                     }
@@ -586,15 +591,22 @@ impl Device {
                         {
                             if retries >= MAX_RETRIES || started_at.elapsed() > RETRY_BUDGET {
                                 tracing::info!(
-                                    retries, elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                    retries,
+                                    elapsed_ms = started_at.elapsed().as_millis() as u64,
                                     "verify retry budget exhausted ({} {:?}); forcing no-match",
-                                    code, detail
+                                    code,
+                                    detail
                                 );
                                 break 'outer Some("verify-no-match");
                             }
                             retries += 1;
-                            tracing::debug!("verify retry {}/{} (firmware {} {:?})",
-                                retries, MAX_RETRIES, code, detail);
+                            tracing::debug!(
+                                "verify retry {}/{} (firmware {} {:?})",
+                                retries,
+                                MAX_RETRIES,
+                                code,
+                                detail
+                            );
                             Device::verify_status(&owned_emitter, "verify-retry-scan", false)
                                 .await
                                 .ok();
@@ -610,7 +622,8 @@ impl Device {
                         // against the same retry budget as firmware-retryables.
                         if retries >= MAX_RETRIES || started_at.elapsed() > RETRY_BUDGET {
                             tracing::info!(
-                                retries, elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                retries,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
                                 "verify retry budget exhausted (rust-side timeout); forcing no-match"
                             );
                             break 'outer Some("verify-no-match");
@@ -655,10 +668,10 @@ impl Device {
             // and the new owner mustn't see a stale signal.
             let still_ours = state.lock().await.end_action_if_owner(my_token);
             if still_ours {
-                if let Some(status) = final_status {
-                    if let Err(e) = Device::verify_status(&owned_emitter, status, true).await {
-                        tracing::warn!("emit final VerifyStatus failed: {}", e);
-                    }
+                if let Some(status) = final_status
+                    && let Err(e) = Device::verify_status(&owned_emitter, status, true).await
+                {
+                    tracing::warn!("emit final VerifyStatus failed: {}", e);
                 }
             } else {
                 tracing::debug!("verify task: token no longer owns action, dropping final status");
@@ -676,13 +689,18 @@ impl Device {
         let _user = self.ensure_claim(sender.as_deref()).await?;
         let mut state = self.state.lock().await;
         match state.action {
-            Some(ActionToken { kind: ActionKind::Verify, .. }) => {
+            Some(ActionToken {
+                kind: ActionKind::Verify,
+                ..
+            }) => {
                 state.action = None;
                 state.finger_needed = false;
                 state.finger_present = false;
                 Ok(())
             }
-            _ => Err(FprintError::NoActionInProgress("no verify in progress".into())),
+            _ => Err(FprintError::NoActionInProgress(
+                "no verify in progress".into(),
+            )),
         }
     }
 
@@ -844,13 +862,18 @@ impl Device {
         let _user = self.ensure_claim(sender.as_deref()).await?;
         let mut state = self.state.lock().await;
         match state.action {
-            Some(ActionToken { kind: ActionKind::Enroll, .. }) => {
+            Some(ActionToken {
+                kind: ActionKind::Enroll,
+                ..
+            }) => {
                 state.action = None;
                 state.finger_needed = false;
                 state.finger_present = false;
                 Ok(())
             }
-            _ => Err(FprintError::NoActionInProgress("no enroll in progress".into())),
+            _ => Err(FprintError::NoActionInProgress(
+                "no enroll in progress".into(),
+            )),
         }
     }
 

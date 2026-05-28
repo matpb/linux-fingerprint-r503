@@ -94,7 +94,7 @@ pub async fn authorize_username(
             &subject,
             ACTION_SETUSERNAME,
             &details,
-            CheckAuthorizationFlags::empty().into(),
+            CheckAuthorizationFlags::empty(),
             "",
         )
         .await
@@ -166,14 +166,26 @@ mod tests {
 
     #[test]
     fn accepts_real_usernames() {
-        for ok in ["mat", "root", "john.doe", "svc-r503", "_systemd", "user1", "a"] {
+        for ok in [
+            "mat", "root", "john.doe", "svc-r503", "_systemd", "user1", "a",
+        ] {
             assert!(validate_username(ok).is_ok(), "should accept {ok:?}");
         }
     }
 
     #[test]
     fn rejects_unsafe_usernames() {
-        for bad in ["", ".", "..", "../etc/shadow", "a/b", "a\\b", "a\nb", "a\0b", "\x07evil"] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../etc/shadow",
+            "a/b",
+            "a\\b",
+            "a\nb",
+            "a\0b",
+            "\x07evil",
+        ] {
             assert!(validate_username(bad).is_err(), "should reject {bad:?}");
         }
     }

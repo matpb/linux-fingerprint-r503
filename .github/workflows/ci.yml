@@ -1,6 +1,8 @@
 name: CI
 
 # Crypto-posture review item #12 + #14 — every PR must pass:
+#  - cargo fmt --check (formatting gate; keeps the tree rustfmt-clean)
+#  - cargo clippy --all-targets -- -D warnings (lint gate; no warnings land)
 #  - cargo test (unit + lib + cross-impl SipHash + framing fuzz smoke)
 #  - cargo audit (RustSec advisory database check)
 #  - firmware compiles for atmega328 (catches header / API regressions)
@@ -27,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
-        run: rustup update stable && rustup default stable
+        run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
       - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
@@ -38,8 +40,12 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('pcside/daemon/Cargo.lock') }}
       - name: Install build deps (tpm2-tss for tss-esapi, libudev for serialport)
         run: sudo apt-get update && sudo apt-get install -y libtss2-dev libudev-dev
+      - name: cargo fmt (check)
+        run: cargo fmt --check
       - name: cargo build
         run: cargo build --all-targets --locked
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: cargo test (unit + lib + integration)
         run: cargo test --locked
       - name: cargo test --release fuzz_framing_smoke (more cycles in release)

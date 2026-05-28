@@ -22,7 +22,9 @@ use std::hash::Hasher;
 /// just need reproducibility from a seed.
 struct Xs64(u64);
 impl Xs64 {
-    fn new(seed: u64) -> Self { Self(seed.max(1)) }
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -119,8 +121,8 @@ fn matches_siphasher_on_canonical_aumasson_vectors() {
     // and the next clue is checking which side matches the Aumasson MACs
     // in `crypto.rs::tests`. (Spoiler: both should match.)
     const K: [u8; 16] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
     ];
     for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 65, 127] {
         let msg: Vec<u8> = (0..len as u8).collect();

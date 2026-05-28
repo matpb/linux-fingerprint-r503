@@ -47,7 +47,10 @@ pub enum SensorError {
     #[error("timed out waiting for response to: {0}")]
     Timeout(String),
     #[error("firmware ERR {code}{detail}", detail = .detail.as_ref().map(|d| format!(" {}", d)).unwrap_or_default())]
-    Command { code: String, detail: Option<String> },
+    Command {
+        code: String,
+        detail: Option<String>,
+    },
     #[error("invalid response from firmware: {0}")]
     Protocol(String),
 }
@@ -131,15 +134,6 @@ impl R503 {
         self.client_counter = next_counter;
     }
 
-    pub fn unset_auth(&mut self) {
-        self.key = None;
-        self.client_counter = 0;
-    }
-
-    pub fn is_authenticated(&self) -> bool {
-        self.key.is_some()
-    }
-
     pub fn port_path(&self) -> &str {
         &self.port_path
     }
@@ -189,10 +183,10 @@ impl R503 {
                     last_byte_at = Some(Instant::now());
                 }
                 Err(ref e) if e.kind() == ErrorKind::TimedOut => {
-                    if let Some(t) = last_byte_at {
-                        if t.elapsed() > silence_after_byte {
-                            break;
-                        }
+                    if let Some(t) = last_byte_at
+                        && t.elapsed() > silence_after_byte
+                    {
+                        break;
                     }
                 }
                 Err(e) => return Err(SensorError::Io(e)),
@@ -353,12 +347,14 @@ impl R503 {
         // higher next, sends C=counter+1, Nano sees a gap, accepts. Crash
         // after send but before next reply ⇒ Nano already updated last_seen
         // to `counter`, daemon's next == counter+1 still works.
-        let next_state = state::State { next_cmd_counter: counter + 1 };
+        let next_state = state::State {
+            next_cmd_counter: counter + 1,
+        };
         state::save(&next_state).map_err(|e| {
-            SensorError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("persist client_counter: {}", e),
-            ))
+            SensorError::Io(std::io::Error::other(format!(
+                "persist client_counter: {}",
+                e
+            )))
         })?;
         self.client_counter = counter + 1;
 
@@ -430,7 +426,10 @@ impl R503 {
 
     fn parse_kv(body: &str) -> HashMap<String, String> {
         body.split_whitespace()
-            .filter_map(|tok| tok.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|tok| {
+                tok.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect()
     }
 
@@ -507,7 +506,10 @@ impl R503 {
 
     pub fn wake(&mut self) -> Result<bool, SensorError> {
         let body = Self::expect_ok(self.execute("wake", TIMEOUT_WAKE_MS)?)?;
-        Ok(Self::parse_kv(&body).get("wake").map(|s| s == "1").unwrap_or(false))
+        Ok(Self::parse_kv(&body)
+            .get("wake")
+            .map(|s| s == "1")
+            .unwrap_or(false))
     }
 
     pub fn ping(&mut self) -> Result<bool, SensorError> {
@@ -541,10 +543,10 @@ pub fn find_port() -> Result<String, SensorError> {
         let mut matches = Vec::new();
         if let Ok(entries) = std::fs::read_dir("/dev") {
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with(pattern) {
-                        matches.push(PathBuf::from("/dev").join(name));
-                    }
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with(pattern)
+                {
+                    matches.push(PathBuf::from("/dev").join(name));
                 }
             }
         }

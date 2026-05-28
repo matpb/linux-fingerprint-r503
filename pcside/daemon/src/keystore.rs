@@ -12,7 +12,7 @@
 
 #![allow(dead_code)] // wired into main.rs --pair / --unpair flows
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -84,12 +84,20 @@ fn read_key_file_guarded(path: &str, allow_mask: u32) -> Option<Zeroizing<String
         return None;
     }
     if meta.uid() != 0 {
-        tracing::warn!(path, uid = meta.uid(), "key file not owned by root; ignoring (M2)");
+        tracing::warn!(
+            path,
+            uid = meta.uid(),
+            "key file not owned by root; ignoring (M2)"
+        );
         return None;
     }
     let mode = meta.permissions().mode() & 0o777;
     if mode & allow_mask != 0 {
-        tracing::warn!(path, mode = format!("{:o}", mode), "key file has insecure mode; ignoring (M2)");
+        tracing::warn!(
+            path,
+            mode = format!("{:o}", mode),
+            "key file has insecure mode; ignoring (M2)"
+        );
         return None;
     }
     let mut f = match fs::OpenOptions::new()
@@ -170,8 +178,7 @@ pub fn save_key(key: &[u8; 16]) -> Result<()> {
         f.write_all(b"\n")?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, KEY_PATH)
-        .with_context(|| format!("renaming {} → {}", tmp, KEY_PATH))?;
+    fs::rename(&tmp, KEY_PATH).with_context(|| format!("renaming {} → {}", tmp, KEY_PATH))?;
 
     // Backup copy: 0400.
     fs::copy(KEY_PATH, KEY_BAK_PATH)
@@ -189,7 +196,11 @@ fn shred_file(path: &str) -> std::io::Result<()> {
     // 33 = 32 hex chars + newline. Match the on-disk layout so block
     // boundaries line up on the fs side.
     let zap = [0xFFu8; 33];
-    match fs::OpenOptions::new().write(true).truncate(false).open(path) {
+    match fs::OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(path)
+    {
         Ok(mut f) => {
             f.write_all(&zap)?;
             f.sync_all()?;
@@ -280,8 +291,7 @@ pub fn delete_all_keys() -> Result<()> {
 /// bytes are wrapped in `Zeroizing` so they scrub on drop.
 pub fn generate_key() -> Result<Zeroizing<[u8; 16]>> {
     let mut key = Zeroizing::new([0u8; 16]);
-    getrandom::fill(&mut *key)
-        .map_err(|e| anyhow::anyhow!("getrandom(2) failed: {e}"))?;
+    getrandom::fill(&mut *key).map_err(|e| anyhow::anyhow!("getrandom(2) failed: {e}"))?;
     Ok(key)
 }
 
@@ -332,8 +342,8 @@ mod tests {
     #[test]
     fn known_vector() {
         let k = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
         ];
         assert_eq!(&*key_hex(&k), "000102030405060708090a0b0c0d0e0f");
     }
@@ -346,7 +356,9 @@ mod tests {
     #[test]
     fn parse_rejects_bad_chars() {
         let mut s = String::from("0102030405060708090a0b0c0d0e0f10");
-        unsafe { s.as_bytes_mut()[0] = b'!'; }
+        unsafe {
+            s.as_bytes_mut()[0] = b'!';
+        }
         assert!(parse_key_hex(&s).is_err());
     }
 }

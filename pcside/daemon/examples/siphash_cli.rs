@@ -12,7 +12,7 @@ mod crypto;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 1 || args.len() > 2 {
+    if args.is_empty() || args.len() > 2 {
         eprintln!("usage: siphash_cli <key_hex(32)> [msg_hex]");
         return ExitCode::from(2);
     }
@@ -44,7 +44,7 @@ fn main() -> ExitCode {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!("odd length {}", s.len()));
     }
     let mut out = Vec::with_capacity(s.len() / 2);

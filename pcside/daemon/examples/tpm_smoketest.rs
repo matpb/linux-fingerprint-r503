@@ -24,8 +24,8 @@ fn main() -> Result<()> {
     println!("PCR7 (sha256):  {}", pcr7);
 
     let key: [u8; 16] = [
-        0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x01, 0x23, 0x45, 0x67,
-        0x89, 0xab, 0xcd, 0xef,
+        0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd,
+        0xef,
     ];
     println!("input key:      {}", hex16(&key));
 
@@ -37,7 +37,11 @@ fn main() -> Result<()> {
     let t1 = Instant::now();
     let recovered = tpm::unseal_key(&blob)?;
     let unseal_ms = t1.elapsed().as_millis();
-    println!("unsealed:       {} (in {} ms)", hex16(&*recovered), unseal_ms);
+    println!(
+        "unsealed:       {} (in {} ms)",
+        hex16(&recovered),
+        unseal_ms
+    );
 
     if *recovered != key {
         anyhow::bail!("round-trip mismatch");

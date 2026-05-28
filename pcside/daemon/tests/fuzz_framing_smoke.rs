@@ -21,18 +21,21 @@ use r503d::{crypto, framing};
 
 struct Xs64(u64);
 impl Xs64 {
-    fn new(seed: u64) -> Self { Self(seed.max(1)) }
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
     fn next(&mut self) -> u64 {
         let mut x = self.0;
-        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 }
 
 const K: [u8; 16] = [
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
 ];
 
 fn poke_all(input: &[u8]) {

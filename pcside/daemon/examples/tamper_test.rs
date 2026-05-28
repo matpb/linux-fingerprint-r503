@@ -8,7 +8,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use r503d::{framing, keystore, state};
 use serialport::SerialPort;
 
@@ -22,8 +22,13 @@ struct Link {
 
 impl Link {
     fn open() -> Result<Self> {
-        let port = serialport::new(PORT, BAUD).timeout(Duration::from_millis(200)).open()?;
-        let mut link = Link { port, rx: Vec::new() };
+        let port = serialport::new(PORT, BAUD)
+            .timeout(Duration::from_millis(200))
+            .open()?;
+        let mut link = Link {
+            port,
+            rx: Vec::new(),
+        };
         // Robust ping handshake (drains boot banner + waits for OK pong).
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut last: Option<String> = None;
@@ -35,10 +40,14 @@ impl Link {
             let per = Instant::now() + Duration::from_millis(800);
             loop {
                 let remaining = per.saturating_duration_since(Instant::now());
-                if remaining.is_zero() { break; }
+                if remaining.is_zero() {
+                    break;
+                }
                 match link.read_line(remaining)? {
                     Some(l) if l == "OK pong" => return Ok(link),
-                    Some(l) => { last = Some(l); }
+                    Some(l) => {
+                        last = Some(l);
+                    }
                     None => break,
                 }
             }
@@ -57,7 +66,9 @@ impl Link {
             let line = self
                 .read_line(deadline.saturating_duration_since(Instant::now()))?
                 .ok_or_else(|| anyhow!("timeout on {}", c))?;
-            if line.is_empty() || line.starts_with("PROGRESS ") { continue; }
+            if line.is_empty() || line.starts_with("PROGRESS ") {
+                continue;
+            }
             return Ok(line);
         }
     }
@@ -68,10 +79,14 @@ impl Link {
             if let Some(nl) = self.rx.iter().position(|&b| b == b'\n') {
                 let mut line: Vec<u8> = self.rx.drain(..=nl).collect();
                 line.pop();
-                if line.last() == Some(&b'\r') { line.pop(); }
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
                 return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
             }
-            if Instant::now() >= deadline { return Ok(None); }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
             self.port.set_timeout(Duration::from_millis(100)).ok();
             let mut buf = [0u8; 256];
             match self.port.read(&mut buf) {
@@ -106,9 +121,16 @@ fn main() -> Result<()> {
     let (rc, rseq, body) = framing::verify_response(&key, &reply)
         .with_context(|| format!("T1 verify response: {:?}", reply))?;
     if rc != counter || rseq != 0 || body != "OK pong" {
-        bad("T1 valid ping", &format!("({},{},{:?})", rc, rseq, body), "(counter,0,\"OK pong\")");
+        bad(
+            "T1 valid ping",
+            &format!("({},{},{:?})", rc, rseq, body),
+            "(counter,0,\"OK pong\")",
+        );
     }
-    ok("T1 valid ping", &format!("counter={} seq={} body={:?}", rc, rseq, body));
+    ok(
+        "T1 valid ping",
+        &format!("counter={} seq={} body={:?}", rc, rseq, body),
+    );
     let advanced_counter = counter + 1;
 
     // T2: replay — re-send the exact same frame. Firmware ee_counter is now
@@ -145,16 +167,28 @@ fn main() -> Result<()> {
     let reply = link.cmd(&frame, Duration::from_secs(2))?;
     let (rc, rseq, body) = framing::verify_response(&key, &reply)?;
     if rc != advanced_counter || rseq != 0 || body != "OK pong" {
-        bad("T5 recovery", &format!("({},{},{:?})", rc, rseq, body), "(advanced,0,OK pong)");
+        bad(
+            "T5 recovery",
+            &format!("({},{},{:?})", rc, rseq, body),
+            "(advanced,0,OK pong)",
+        );
     }
-    ok("T5 recovery after tampering", &format!("counter={} body={:?}", rc, body));
+    ok(
+        "T5 recovery after tampering",
+        &format!("counter={} body={:?}", rc, body),
+    );
 
     // Re-sync host state.json so the daemon doesn't replay-fail on its next
     // send. Firmware's last_seen is now `advanced_counter`; daemon needs
     // next > that.
     counter = advanced_counter + 1;
-    state::save(&state::State { next_cmd_counter: counter })?;
-    println!("\nstate.json bumped to next_cmd_counter={} for daemon resume", counter);
+    state::save(&state::State {
+        next_cmd_counter: counter,
+    })?;
+    println!(
+        "\nstate.json bumped to next_cmd_counter={} for daemon resume",
+        counter
+    );
     println!("\nPASS");
     Ok(())
 }

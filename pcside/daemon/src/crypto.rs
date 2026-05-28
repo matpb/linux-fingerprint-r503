@@ -22,10 +22,20 @@ fn load_u64_le(p: &[u8]) -> u64 {
 
 macro_rules! sipround {
     ($v0:expr, $v1:expr, $v2:expr, $v3:expr) => {{
-        $v0 = $v0.wrapping_add($v1); $v1 = rotl64($v1, 13); $v1 ^= $v0; $v0 = rotl64($v0, 32);
-        $v2 = $v2.wrapping_add($v3); $v3 = rotl64($v3, 16); $v3 ^= $v2;
-        $v0 = $v0.wrapping_add($v3); $v3 = rotl64($v3, 21); $v3 ^= $v0;
-        $v2 = $v2.wrapping_add($v1); $v1 = rotl64($v1, 17); $v1 ^= $v2; $v2 = rotl64($v2, 32);
+        $v0 = $v0.wrapping_add($v1);
+        $v1 = rotl64($v1, 13);
+        $v1 ^= $v0;
+        $v0 = rotl64($v0, 32);
+        $v2 = $v2.wrapping_add($v3);
+        $v3 = rotl64($v3, 16);
+        $v3 ^= $v2;
+        $v0 = $v0.wrapping_add($v3);
+        $v3 = rotl64($v3, 21);
+        $v3 ^= $v0;
+        $v2 = $v2.wrapping_add($v1);
+        $v1 = rotl64($v1, 17);
+        $v1 ^= $v2;
+        $v2 = rotl64($v2, 32);
     }};
 }
 
@@ -88,8 +98,8 @@ mod tests {
     use super::*;
 
     const STANDARD_KEY: [u8; 16] = [
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
     ];
 
     // Canonical Aumasson/Bernstein test vectors. Reference C implementation

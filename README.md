@@ -1,5 +1,12 @@
 # linux-fingerprint-r503 — fingerprint login for Linux using a Grow R503 + Arduino
 
+[![CI](https://github.com/matpb/linux-fingerprint-r503/actions/workflows/ci.yml/badge.svg)](https://github.com/matpb/linux-fingerprint-r503/actions/workflows/ci.yml)
+[![r503d](https://img.shields.io/badge/r503d-1.0.0-success)](pcside/daemon/Cargo.toml)
+[![firmware](https://img.shields.io/badge/firmware-fw%201.0-success)](firmware/r503fp/r503fp.ino)
+[![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-CE412B?logo=rust&logoColor=white)](pcside/daemon/Cargo.toml)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-1793D1?logo=linux&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A from-parts USB fingerprint reader for Linux desktops. Total parts cost
 under $15. Drop-in replacement for upstream `fprintd` — PAM, KDE Settings,
 GNOME Settings, `fprintd-verify`, `sudo` with finger, screen-unlock with
@@ -297,6 +304,25 @@ The script needs `arduino-cli` available. If it's installed in your
 user's `$HOME/.local/bin` it's auto-detected via `$SUDO_USER`; otherwise
 set `ARDUINO_CLI=/full/path/to/arduino-cli` before running.
 
+### Recovery: lost `state.json` (counter desync)
+
+If the host key is intact but `/var/lib/r503d/state.json` is gone or rolled
+back (restored an old backup, accidental rm), the daemon's counter falls
+behind the Nano's `last_seen` and every framed command bounces off
+`ERR replay`. `r503d --status` flags this; the fix is one command:
+
+```bash
+sudo systemctl stop r503d
+sudo r503d --resync                         # reads Nano last_seen, sets host counter to last_seen+1
+sudo systemctl start r503d
+```
+
+No re-pair, no reflash — the key never moves. The `status` query `--resync`
+relies on is unauthenticated, but it can only move the host counter *forward*
+to match what the Nano already committed, so it can never make an old frame
+replayable (worst case a lying MITM forces another `ERR replay`, which it
+could already do by garbling frames). See [`SPEC.md` §13.11](SPEC.md).
+
 ### Recovery: lost the host key entirely
 
 The authenticated `--unpair` needs the key to authorize. If all the
@@ -457,9 +483,10 @@ Full threat model with rationale: [`SPEC.md` §13.1](SPEC.md).
 - **Single Nano = single point of failure.** If the Nano dies, fingerprint
   login is gone until you reflash a spare and re-pair. Keep a password
   auth method enabled as backup.
-- **No `r503d --resync` yet.** If `state.json` is lost while the firmware
-  still has a high `last_seen`, the daemon will hit `ERR replay` on first
-  send and need a manual reflash-to-wipe + re-pair. See [`SPEC.md` §13.11](SPEC.md).
+- **State.json loss is recoverable in one command.** If `state.json` is lost
+  while the firmware still has a high `last_seen`, the daemon hits `ERR replay`
+  on first send. Run `sudo r503d --resync` to read the Nano's counter and
+  realign the host — no re-pair needed. See [`SPEC.md` §13.11](SPEC.md).
 
 ## Troubleshooting
 
