@@ -459,7 +459,9 @@ Every other command requires framing on a paired Nano. Unframed traffic to a pai
 | Moderate (20/day) | ~60 | ~73 |
 | Heavy (50/day) | ~150 | ~29 |
 
-The 64-bit counter itself wraps in geological time; not a concern.
+The 64-bit counter never wraps through *natural* use (geological time). It can, however, be **driven** to the top of the range by a malicious or buggy peer, which is the real concern — see the counter ceiling below.
+
+**Counter ceiling (`fw=1.1+` / `r503d 1.1.0+`).** Both ends reserve the top `2^16` counter values: any counter `>= COUNTER_CEILING` (`0xFFFF_FFFF_FFFF_0000`) is refused — the firmware answers `ERR counter_ceiling` and commits nothing; the daemon refuses to emit or resync to such a value. Without this, a single frame carrying `counter = u64::MAX` (from a key-holding peer, or a one-shot wire-MITM forging the unauthenticated `status counter=…` that `--resync` trusted) would commit `last_seen = MAX` to EEPROM. From then on every framed command — *including the framed `unpair` recovery, which is itself gated by the counter check* — would need `counter > MAX`, which is impossible: a permanent brick recoverable only by physical reflash-to-wipe. The ceiling makes the brick structurally impossible while leaving the entire usable range intact (lifetime max ≈ 1.6M advances, §13.4). The constant is mirrored byte-for-byte in `firmware/r503fp/framing.h` and `pcside/daemon/src/framing.rs` and pinned by a unit test. (Security audit 2026-05-28 / firmware DoS-2.)
 
 **False-positive CRC matches.** Per-cell, the chance of bit-rot producing a spuriously valid CRC is 1/65,536 (CRC-16). With 16 cells the union bound puts the boot-time "wrong cell mistaken for valid" probability at ~1/4096 — only relevant if EEPROM cells actually decay (multi-decade timescales for ATmega328P at room temperature). Detected mismatches would manifest as a counter regression, blocked by `ERR replay`; the daemon would surface it and the user re-pairs.
 

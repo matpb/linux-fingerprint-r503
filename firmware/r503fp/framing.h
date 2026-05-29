@@ -19,6 +19,18 @@
 
 namespace r503 {
 
+// Reserved high band of the 64-bit command counter. The firmware refuses to
+// commit any counter at or above this value (see r503fp.ino process_line), and
+// the daemon refuses to emit one (pcside/daemon/src/framing.rs COUNTER_CEILING,
+// which MUST hold the identical value). This makes counter exhaustion
+// impossible: without it, a single frame carrying counter=u64::MAX would commit
+// last_seen=MAX to EEPROM, after which every future command — including the
+// framed `unpair` recovery — needs ctr > MAX, bricking the channel until a
+// physical reflash. The band is 2^16 slots; the lifetime maximum is ~1.6M
+// counter bumps (SPEC §13.4), so the ceiling is never reached in normal use.
+// (Security audit 2026-05-28 / firmware DoS-2.)
+constexpr uint64_t COUNTER_CEILING = 0xFFFFFFFFFFFF0000ULL;
+
 // ---------- hex + decimal helpers ----------
 
 inline bool hex_nybble(char c, uint8_t* out) {

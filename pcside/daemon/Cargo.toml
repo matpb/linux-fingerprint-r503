@@ -1,8 +1,8 @@
 [package]
 name = "r503d"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
-description = "fprintd-replacement daemon for the R503 fingerprint reader over USB-serial. v1.0 = authenticated wire protocol (SPEC §13) cutover; firmware must be fw=1.0+."
+description = "fprintd-replacement daemon for the R503 fingerprint reader over USB-serial. v1.0 = authenticated wire protocol (SPEC §13) cutover; v1.1 = counter-ceiling hardening (firmware DoS-2). Firmware must be fw=1.0+ (fw=1.1+ for the ceiling guard)."
 license = "MIT"
 repository = "https://github.com/matpb/linux-fingerprint-r503"
 readme = "../../README.md"
@@ -50,3 +50,7 @@ opt-level = 3
 lto = "thin"
 strip = true
 codegen-units = 1
+# Trap integer overflow in release too (it's already on in debug). For a
+# security daemon, a silent wraparound in counter arithmetic is worse than a
+# loud panic — see the DoS-2 counter-wrap fix (security audit 2026-05-28).
+overflow-checks = true

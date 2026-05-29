@@ -421,6 +421,20 @@ pub fn run_reseal_tpm(port_override: Option<&str>, seal_tpm_pcrs: Option<&str>) 
     run_pair(port_override, /*seal_tpm=*/ true, seal_tpm_pcrs)
 }
 
+/// Compute the post-resync `next_cmd_counter` from the Nano's reported
+/// `last_seen`, refusing any value in the reserved ceiling band. Pure +
+/// total so the keyless-MITM brick vector is unit-testable without a serial
+/// port (security audit 2026-05-28 / firmware DoS-2).
+fn resync_target(reported_last_seen: u64) -> Result<u64> {
+    if reported_last_seen >= framing::COUNTER_CEILING - 1 {
+        bail!(
+            "reported counter {} is at/above the reserved ceiling",
+            reported_last_seen
+        );
+    }
+    Ok(reported_last_seen + 1)
+}
+
 /// Recover from a lost or rolled-back `state.json` while the Nano is still
 /// paired and the host key still exists (SPEC §13.11).
 ///
@@ -439,8 +453,13 @@ pub fn run_reseal_tpm(port_override: Option<&str>, seal_tpm_pcrs: Option<&str>) 
 ///     `ERR replay` (a self-inflicted DoS a MITM can already cause by garbling
 ///     frames); no old frame becomes replayable, because the Nano's real
 ///     `last_seen` is unchanged.
-///   - A too-high value harmlessly skips counter slots (the Nano accepts any
-///     value strictly greater than its `last_seen`).
+///   - A reported value in the reserved ceiling band is REFUSED (see
+///     `resync_target`). Previously it was accepted and could drive the host's
+///     persisted counter to `u64::MAX`, so the next real `counter + 1` wrapped
+///     to 0 and permanently desynced the channel — a MITM lying `counter=MAX`
+///     during a single resync was enough (security audit 2026-05-28 /
+///     firmware DoS-2). The firmware now also refuses to commit a ceiling
+///     counter, so neither end can be bricked.
 pub fn run_resync(port_override: Option<&str>) -> Result<()> {
     // A host key must still exist — resync recovers counter state, not the
     // pairing itself. With no key we couldn't authenticate any command anyway,
@@ -474,9 +493,16 @@ pub fn run_resync(port_override: Option<&str>) -> Result<()> {
     }
 
     // `last_seen + 1` is the lowest counter the firmware will accept next.
-    // saturating_add guards the (astronomically unlikely) u64 exhaustion edge
-    // rather than panicking on overflow.
-    let new_counter = fw.counter.saturating_add(1);
+    // resync_target refuses a reported counter in the reserved ceiling band so
+    // an unauthenticated `status` can't drive us into the brick/wrap zone.
+    let new_counter = resync_target(fw.counter).with_context(|| {
+        format!(
+            "Nano reported counter {} in the reserved ceiling band — refusing \
+             to resync (suspected MITM or corrupt EEPROM). Reflash-to-wipe \
+             (firmware/r503fp_wipe) + re-pair to reset.",
+            fw.counter
+        )
+    })?;
     let old = state::load().context("loading current client counter state")?;
     state::save(&state::State {
         next_cmd_counter: new_counter,
@@ -532,6 +558,15 @@ pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
         .context("loading client counter state")?
         .unwrap_or_else(state::State::fresh);
     let counter = st.next_cmd_counter;
+    // Refuse to advance into the reserved ceiling band (security audit
+    // 2026-05-28 / firmware DoS-2). counter < CEILING ⇒ counter+1 can't wrap.
+    if counter >= framing::COUNTER_CEILING {
+        bail!(
+            "v2 counter {} is at/above the reserved ceiling; reflash-to-wipe \
+             (firmware/r503fp_wipe) + re-pair to reset",
+            counter
+        );
+    }
     // Persist counter+1 BEFORE send (SPEC §13.4): crash here ⇒ next start
     // skips one counter slot, never replays.
     state::save(&state::State {
@@ -582,6 +617,27 @@ pub fn run_unpair(port_override: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::keystore;
+
+    // DoS-2: a forged/exhausted unauthenticated `status counter=...` must not be
+    // able to drive the host's persisted counter into the brick/wrap zone.
+    #[test]
+    fn resync_target_advances_below_ceiling() {
+        assert_eq!(resync_target(0).unwrap(), 1);
+        assert_eq!(resync_target(41).unwrap(), 42);
+        assert_eq!(
+            resync_target(framing::COUNTER_CEILING - 2).unwrap(),
+            framing::COUNTER_CEILING - 1
+        );
+    }
+
+    #[test]
+    fn resync_target_refuses_ceiling_band() {
+        // The exact MITM-during-resync vector: a lie of u64::MAX (and anything
+        // that would land at/above the ceiling) is rejected, not trusted.
+        assert!(resync_target(u64::MAX).is_err());
+        assert!(resync_target(framing::COUNTER_CEILING).is_err());
+        assert!(resync_target(framing::COUNTER_CEILING - 1).is_err());
+    }
 
     // Regression guard for audit finding L-pairing-key-in-error: a reply
     // timeout during `--pair`/`--unpair` must never interpolate the wire bytes
