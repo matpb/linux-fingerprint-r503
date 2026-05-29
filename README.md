@@ -1,8 +1,8 @@
 # linux-fingerprint-r503 — fingerprint login for Linux using a Grow R503 + Arduino
 
 [![CI](https://github.com/matpb/linux-fingerprint-r503/actions/workflows/ci.yml/badge.svg)](https://github.com/matpb/linux-fingerprint-r503/actions/workflows/ci.yml)
-[![r503d](https://img.shields.io/badge/r503d-1.0.0-success)](pcside/daemon/Cargo.toml)
-[![firmware](https://img.shields.io/badge/firmware-fw%201.0-success)](firmware/r503fp/r503fp.ino)
+[![r503d](https://img.shields.io/badge/r503d-1.1.0-success)](pcside/daemon/Cargo.toml)
+[![firmware](https://img.shields.io/badge/firmware-fw%201.1-success)](firmware/r503fp/r503fp.ino)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-CE412B?logo=rust&logoColor=white)](pcside/daemon/Cargo.toml)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-1793D1?logo=linux&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -203,7 +203,7 @@ sudo systemctl start r503d
 ```bash
 sudo r503d --status
 # port:             /dev/r503
-# firmware:         fw=1.0 fmt=2
+# firmware:         fw=1.1 fmt=2
 # firmware paired:  true
 # firmware counter: 42
 # host key.tpm:     (absent)
@@ -231,7 +231,7 @@ sudo systemctl start r503d
 ```bash
 sudo r503d --status
 # port:             /dev/r503
-# firmware:         fw=1.0 fmt=2
+# firmware:         fw=1.1 fmt=2
 # firmware paired:  true
 # firmware counter: 12
 # host key.tpm:     /var/lib/r503d/key.tpm
@@ -422,6 +422,13 @@ and
   could, it has no key, so the frame fails MAC verify.
 - Replay of recorded `OK match=...` frames in a future session.
 - Bit-flip tampering of any frame field (constant-time MAC compare).
+- Counter-exhaustion brick: a peer (or a one-shot MITM during `--resync`)
+  driving the monotonic counter to `u64::MAX` and permanently wedging the
+  channel is blocked by a reserved counter ceiling enforced on both ends
+  (`fw=1.1+`; SPEC §13.4 / 2026-05-28 audit DoS-2).
+- Local-user denial-of-service of the sensor: a single capture-slot gate
+  caps in-flight enroll/verify work and the delete paths are action-gated,
+  so a `Start`/`Stop` (or concurrent-delete) flood can't wedge auth.
 - Cross-user fingerprint plant / wipe / enumeration by a local non-root
   user (e.g. `mallory` calling `Claim "root"` then enrolling her own
   finger) — caller identity is checked on every `username`-taking D-Bus

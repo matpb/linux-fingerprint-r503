@@ -20,6 +20,18 @@ use zeroize::Zeroizing;
 const MAC_HEX_LEN: usize = 16;
 const MAC_SUFFIX_LEN: usize = 3 + MAC_HEX_LEN; // " M " + 16 hex
 
+/// Reserved high band of the 64-bit command counter. Counters at or above this
+/// value are refused by BOTH ends so the monotonic counter can never be driven
+/// to (or near) `u64::MAX` — which would brick the authenticated channel: once
+/// the firmware commits `last_seen = MAX` to EEPROM, every future command
+/// (including the framed `unpair` recovery) needs `ctr > MAX`, impossible, and
+/// the only recovery is a physical reflash. The reserved band is 2^16 slots;
+/// the lifetime maximum is ~1.6M increments (~88 years at 50 logins/day, SPEC
+/// §13.4), so the ceiling is unreachable in normal operation. Value MUST be
+/// mirrored exactly in `firmware/r503fp/framing.h` (`COUNTER_CEILING`).
+/// (Security audit 2026-05-28 / firmware DoS-2.)
+pub const COUNTER_CEILING: u64 = 0xFFFF_FFFF_FFFF_0000;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum FramingError {
     #[error("frame too short ({0} bytes)")]
@@ -217,6 +229,14 @@ mod tests {
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f,
     ];
+
+    #[test]
+    fn counter_ceiling_is_the_agreed_constant() {
+        // MUST equal firmware/r503fp/framing.h COUNTER_CEILING (0xFFFFFFFFFFFF0000).
+        // A divergence here is a silent lockstep break, so pin it (DoS-2).
+        assert_eq!(COUNTER_CEILING, 0xFFFF_FFFF_FFFF_0000);
+        assert_eq!(u64::MAX - COUNTER_CEILING, 0xFFFF); // exactly 2^16-1 reserved slots above
+    }
 
     #[test]
     fn command_round_trip() {

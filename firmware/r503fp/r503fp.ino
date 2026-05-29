@@ -91,7 +91,7 @@ void emitInfo() {
   }
   finger.getParameters();
   finger.getTemplateCount();
-  g_out->print(F("OK fw=1.0 capacity="));
+  g_out->print(F("OK fw=1.1 capacity="));
   g_out->print(finger.capacity);
   g_out->print(F(" enrolled="));
   g_out->print(finger.templateCount);
@@ -213,7 +213,7 @@ void handleStatus() {
   g_out->print(ctr_buf);
   g_out->print(F(" fmt="));
   g_out->print(r503::EE_FORMAT_VERSION);
-  g_out->println(F(" fw=1.0"));
+  g_out->println(F(" fw=1.1"));
 }
 
 // Milestone D pairing commands. `pair` is the daemon-driven pairing path
@@ -314,6 +314,19 @@ void process_line(const String& line) {
     Serial.println(F("ERR replay"));
     return;
   }
+  // Refuse the reserved ceiling band and NEVER commit it (security audit
+  // 2026-05-28 / firmware DoS-2). Without this, a frame carrying counter=MAX
+  // would persist last_seen=MAX, after which every future command — including
+  // the framed `unpair` recovery, which is gated by this very check — needs
+  // ctr > MAX and is impossible, bricking the channel until a physical reflash.
+  // The daemon mirrors this in framing.rs (COUNTER_CEILING) so a compliant host
+  // never emits such a frame; this guard defends against a malicious/buggy peer.
+  // g_out is still &Serial here, so the error goes out unframed; nothing is
+  // committed, so the counter cannot advance into the brick zone.
+  if (ctr >= r503::COUNTER_CEILING) {
+    Serial.println(F("ERR counter_ceiling"));
+    return;
+  }
   // Commit the new counter BEFORE handler runs so a crash-and-restart can't
   // be tricked into accepting the same counter twice. The handler's output
   // (success or failure) is irrelevant for replay protection — what matters
@@ -368,7 +381,18 @@ void dispatch(const String& line) {
   else if (line == "wake") { g_out->print(F("OK wake=")); g_out->println(digitalRead(PIN_WAKE) == LOW ? '1' : '0'); }
   else if (line == "ping") g_out->println(F("OK pong"));
   else if (line == "led off") { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->println(F("OK")); }
-  else { g_out->print(F("ERR unknown_command ")); g_out->println(line); }
+  else {
+    // Truncate the echoed verb. The framed response body is "ERR unknown_command "
+    // (20) + this echo, and compute_resp_mac (framing.h) builds it into a fixed
+    // 128-byte buffer alongside "RSP <ctr> <seq> ". An unbounded echo (the inner
+    // body is up to 95 bytes) could push that past 128 once the counter/seq grow,
+    // making the response un-encodable: the firmware would fall back to an
+    // UNFRAMED `ERR encode_overflow` AFTER the replay counter was already burned,
+    // desyncing the channel. Capping at 40 keeps body <= 60 so the frame always
+    // encodes for any counter/seq (security audit 2026-05-28 / protocol DoS-1).
+    g_out->print(F("ERR unknown_command "));
+    g_out->println(line.substring(0, 40));
+  }
 }
 
 // Boot-time SipHash KAT self-test. Runs 4 canonical Aumasson vectors
@@ -421,7 +445,7 @@ void setup() {
     }
   }
 
-  Serial.print(F("R503FP READY fw=1.0 paired="));
+  Serial.print(F("R503FP READY fw=1.1 paired="));
   Serial.println(r503::ee_is_paired() ? F("true") : F("false"));
   finger.begin(FP_BAUD);
   emitInfo();

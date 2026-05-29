@@ -53,6 +53,25 @@ pub enum SensorError {
     },
     #[error("invalid response from firmware: {0}")]
     Protocol(String),
+    #[error(
+        "v2 command counter exhausted (reached the reserved ceiling); \
+         reflash-to-wipe (firmware/r503fp_wipe) + re-pair to reset"
+    )]
+    CounterExhausted,
+}
+
+/// Advance the monotonic command counter by one, refusing to enter the reserved
+/// ceiling band. Returns `CounterExhausted` rather than wrapping past `u64::MAX`
+/// — a plain `counter + 1` wraps to 0 in a release build (overflow-checks off),
+/// which would silently roll replay protection back to the lowest floor. Pairing
+/// the ceiling guard with the wrap guard closes both (security audit 2026-05-28
+/// / firmware DoS-2). Pure + counter-only so it is unit-testable without a port.
+fn advance_counter(counter: u64) -> Result<u64, SensorError> {
+    if counter >= framing::COUNTER_CEILING {
+        return Err(SensorError::CounterExhausted);
+    }
+    // counter < COUNTER_CEILING < u64::MAX, so +1 cannot overflow.
+    Ok(counter + 1)
 }
 
 #[derive(Debug, Clone)]
@@ -343,12 +362,17 @@ impl R503 {
             .clone();
         let counter = self.client_counter;
 
+        // Refuse to advance into the reserved ceiling band BEFORE we persist or
+        // send anything — both the counter-exhaustion brick and the release-mode
+        // `+1` wrap are closed here (security audit 2026-05-28 / firmware DoS-2).
+        let next = advance_counter(counter)?;
+
         // Persist next BEFORE sending. Crash here ⇒ daemon restart sees the
         // higher next, sends C=counter+1, Nano sees a gap, accepts. Crash
         // after send but before next reply ⇒ Nano already updated last_seen
         // to `counter`, daemon's next == counter+1 still works.
         let next_state = state::State {
-            next_cmd_counter: counter + 1,
+            next_cmd_counter: next,
         };
         state::save(&next_state).map_err(|e| {
             SensorError::Io(std::io::Error::other(format!(
@@ -356,7 +380,7 @@ impl R503 {
                 e
             )))
         })?;
-        self.client_counter = counter + 1;
+        self.client_counter = next;
 
         let frame = framing::encode_command(&key, counter, cmd);
         self.rx_buf.clear();
@@ -556,4 +580,35 @@ pub fn find_port() -> Result<String, SensorError> {
         }
     }
     Err(SensorError::NoDevice)
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    // DoS-2: the send path must never wrap past u64::MAX (which would roll the
+    // persisted counter back to 0 in a release build) or advance into the
+    // reserved ceiling band that bricks the firmware's replay counter.
+    #[test]
+    fn advance_counter_increments_below_ceiling() {
+        assert_eq!(advance_counter(0).unwrap(), 1);
+        assert_eq!(advance_counter(41).unwrap(), 42);
+        assert_eq!(
+            advance_counter(framing::COUNTER_CEILING - 2).unwrap(),
+            framing::COUNTER_CEILING - 1
+        );
+    }
+
+    #[test]
+    fn advance_counter_refuses_ceiling_instead_of_wrapping() {
+        assert!(matches!(
+            advance_counter(framing::COUNTER_CEILING),
+            Err(SensorError::CounterExhausted)
+        ));
+        // The release-mode wrap target: u64::MAX would have wrapped to 0.
+        assert!(matches!(
+            advance_counter(u64::MAX),
+            Err(SensorError::CounterExhausted)
+        ));
+    }
 }

@@ -6,7 +6,7 @@ Arduino sketches for the R503 + Nano bridge.
 
 - **`r503fp/`** — production firmware. Implements the v2 authenticated wire
   protocol (SPEC §13): SipHash-2-4 MAC over every command and response, monotonic
-  counter persisted to EEPROM, TOFU pairing. Banner is `R503FP READY fw=1.0 paired=<bool>`.
+  counter persisted to EEPROM, TOFU pairing. Banner is `R503FP READY fw=1.1 paired=<bool>`.
 - **`r503fp_wipe/`** — one-shot emergency EEPROM wipe. Use when you've lost the
   host-side key file (`/var/lib/r503d/key`). Flash this, wait for the LED to
   start blinking, then flash `r503fp/` back and re-pair via `r503d --pair`.
@@ -81,7 +81,7 @@ To clear pairing without the host key, use `r503fp_wipe/`.
 tio -b 115200 /dev/r503
 
 # Type `ping` and press Enter — expect `OK pong`.
-# Type `status`           — expect `OK paired=<bool> counter=<N> fmt=2 fw=1.0`.
+# Type `status`           — expect `OK paired=<bool> counter=<N> fmt=2 fw=1.1`.
 ```
 
 Both of those work even on a paired Nano without sending a MAC; everything

@@ -138,8 +138,11 @@ inline uint64_t ee_load_counter() {
   return ee_scan_ring().max_counter; // 0 if no valid cell
 }
 
-// Saves `new_counter` to the next cell in the ring (cyclic). Returns false
-// only on overflow guards (none currently).
+// Saves `new_counter` to the next cell in the ring (cyclic). Always returns
+// true; the reserved-ceiling guard that prevents counter exhaustion is enforced
+// upstream in process_line() (r503fp.ino) BEFORE this is called, so a
+// ceiling/MAX counter never reaches the ring (security audit 2026-05-28 /
+// firmware DoS-2).
 inline bool ee_save_counter(uint64_t new_counter) {
   RingScan s = ee_scan_ring();
   uint8_t next_cell = s.any_valid

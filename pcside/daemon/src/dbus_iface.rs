@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -189,6 +189,7 @@ struct ActionToken {
 enum ActionKind {
     Enroll,
     Verify,
+    Delete,
 }
 
 impl ActionKind {
@@ -196,6 +197,7 @@ impl ActionKind {
         match self {
             ActionKind::Enroll => "enroll",
             ActionKind::Verify => "verify",
+            ActionKind::Delete => "delete",
         }
     }
 }
@@ -231,6 +233,25 @@ pub struct Device {
     pub storage: Storage,
     pub confidence_threshold: u16,
     state: Arc<Mutex<DeviceState>>,
+    /// One permit standing in for the single physical sensor worker slot.
+    ///
+    /// `state.action` only gates the *D-Bus surface*: VerifyStop/EnrollStop
+    /// clear it the instant they're called, but the task they spawned has
+    /// already pushed a `SensorRequest` onto the worker's UNBOUNDED mpsc
+    /// (`sensor_actor.rs`) and is parked awaiting the reply, which the
+    /// single-threaded worker drains for the full firmware timeout (15s verify
+    /// / 45s enroll). So a Start/Stop churn loop could enqueue an unbounded
+    /// backlog of capture requests and leak a live task per iteration —
+    /// memory + task-slot exhaustion that wedges legitimate PAM auth for hours
+    /// (security audit 2026-05-28 / DoS-1).
+    ///
+    /// This permit is acquired with `try_acquire_owned()` BEFORE a capture task
+    /// is spawned and moved INTO that task, so it is released only when the
+    /// task fully returns — i.e. after the sensor op has actually drained out
+    /// of the worker. A fresh Start cannot get a permit until then, capping
+    /// queued + in-flight captures (and orphaned tasks) at exactly one
+    /// regardless of how fast a caller churns Start/Stop.
+    capture_slot: Arc<Semaphore>,
 }
 
 impl Device {
@@ -240,7 +261,27 @@ impl Device {
             storage,
             confidence_threshold,
             state: Arc::new(Mutex::new(DeviceState::default())),
+            capture_slot: Arc::new(Semaphore::new(1)),
         }
+    }
+
+    /// Acquire the single-in-flight action gate for a delete, mirroring the
+    /// mint-under-lock pattern in verify_start/enroll_start. Returns the token
+    /// the caller MUST clear with `end_action_if_owner` once the sensor work
+    /// finishes (on every exit path). Without this, the delete entry points
+    /// were neither action-gated nor (for the legacy path) claim-gated, so
+    /// concurrent self-invocations each pushed one delete-per-slot onto the
+    /// unbounded worker queue and could flood it, starving auth — a cousin of
+    /// DoS-1 (security audit 2026-05-28 / DEL-1).
+    async fn begin_delete(&self) -> Result<ActionToken, FprintError> {
+        let mut state = self.state.lock().await;
+        if let Some(t) = state.action {
+            return Err(FprintError::AlreadyInUse(format!(
+                "{} already in progress",
+                t.kind.as_str()
+            )));
+        }
+        Ok(state.start_action(ActionKind::Delete))
     }
 
     async fn ensure_claim(&self, sender: Option<&str>) -> Result<String, FprintError> {
@@ -348,7 +389,11 @@ impl Device {
         // but this legacy entry point is still exposed for upstream parity.
         let sender = header.sender().map(|s| s.to_string());
         let user = crate::auth::authorize_username(conn, sender.as_deref(), &username).await?;
-        delete_user_fingers(&self.sensor, &self.storage, &user).await
+        // Gate so concurrent self-calls can't flood the sensor queue (DEL-1).
+        let token = self.begin_delete().await?;
+        let res = delete_user_fingers(&self.sensor, &self.storage, &user).await;
+        self.state.lock().await.end_action_if_owner(token);
+        res
     }
 
     #[zbus(name = "DeleteEnrolledFingers2")]
@@ -358,7 +403,10 @@ impl Device {
     ) -> Result<(), FprintError> {
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
-        delete_user_fingers(&self.sensor, &self.storage, &user).await
+        let token = self.begin_delete().await?;
+        let res = delete_user_fingers(&self.sensor, &self.storage, &user).await;
+        self.state.lock().await.end_action_if_owner(token);
+        res
     }
 
     async fn delete_enrolled_finger(
@@ -376,7 +424,11 @@ impl Device {
             .ok_or_else(|| {
                 FprintError::NoEnrolledPrints(format!("{} not enrolled for {}", finger_name, user))
             })?;
+        // Gate the sensor work so concurrent deletes can't flood the queue
+        // (DEL-1). Cleared on every exit path below.
+        let token = self.begin_delete().await?;
         if let Err(e) = self.sensor.delete(slot).await {
+            self.state.lock().await.end_action_if_owner(token);
             tracing::warn!("sensor delete slot {} failed: {}", slot, e);
             return Err(FprintError::PrintsNotDeleted(format!(
                 "sensor delete failed for slot {}: {}",
@@ -384,7 +436,9 @@ impl Device {
             )));
         }
         // Sensor template gone; registry remove is the bookkeeping tail.
-        self.storage.remove_finger(&user, &finger_name).await?;
+        let res = self.storage.remove_finger(&user, &finger_name).await;
+        self.state.lock().await.end_action_if_owner(token);
+        res?;
         Ok(())
     }
 
@@ -477,6 +531,18 @@ impl Device {
         // closes it outright. get_user_slots only touches the independent
         // storage RwLock, so holding the state mutex across it is deadlock-free
         // (nothing acquires storage-then-state). (Audit 2026-05-28 / L1.)
+        // Claim the physical sensor slot up front. If a previous capture task
+        // is still alive (queued or draining in the worker) this fails even
+        // though `state.action` may already be None — VerifyStop/EnrollStop
+        // clear the D-Bus gate but not the in-flight work. Holding this for the
+        // task's whole life is what bounds the worker queue under Start/Stop
+        // churn (security audit 2026-05-28 / DoS-1). Dropped automatically on
+        // any early return below, freeing the slot.
+        let permit =
+            self.capture_slot.clone().try_acquire_owned().map_err(|_| {
+                FprintError::AlreadyInUse("sensor busy with a previous capture".into())
+            })?;
+
         let (my_token, user_slots) = {
             let mut state = self.state.lock().await;
             if let Some(t) = state.action {
@@ -537,6 +603,10 @@ impl Device {
         // lines inline via select!, so there's no second receiver task to
         // leak and no abort-races-queued-message footgun.
         tokio::spawn(async move {
+            // Held for the whole task: released only once the sensor op has
+            // fully drained out of the worker, so the next Start can't enqueue
+            // until then (security audit 2026-05-28 / DoS-1).
+            let _permit = permit;
             let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
             // Retry budget (audit §P1-7 / §S4.2): the firmware-asks-retry
@@ -714,6 +784,15 @@ impl Device {
         let sender = header.sender().map(|s| s.to_string());
         let user = self.ensure_claim(sender.as_deref()).await?;
 
+        // Claim the physical sensor slot up front (see verify_start and the
+        // `capture_slot` field doc). Bounds the worker queue + live tasks under
+        // EnrollStart/EnrollStop churn (security audit 2026-05-28 / DoS-1).
+        // Dropped on any early return below, freeing the slot.
+        let permit =
+            self.capture_slot.clone().try_acquire_owned().map_err(|_| {
+                FprintError::AlreadyInUse("sensor busy with a previous capture".into())
+            })?;
+
         let my_token = {
             let mut state = self.state.lock().await;
             if let Some(t) = state.action {
@@ -771,6 +850,9 @@ impl Device {
         let user_for_task = user.clone();
         let finger_for_task = finger_name.clone();
         tokio::spawn(async move {
+            // Held for the whole task: released only once the sensor op has
+            // fully drained out of the worker (security audit 2026-05-28 / DoS-1).
+            let _permit = permit;
             let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let enroll_fut = sensor.enroll(slot, Some(prog_tx.clone()));
             tokio::pin!(enroll_fut);
@@ -905,3 +987,99 @@ impl Device {
 // signals (and the GUI fprintd consumers that watch finger-present mostly
 // just animate a UI hint). If a frontend turns out to need it, hook the
 // zbus-generated `<name>_changed(&self, emitter)` helpers here.
+
+#[cfg(test)]
+mod capture_slot_tests {
+    //! Unit coverage for the DoS-1 fix (security audit 2026-05-28). No sensor
+    //! hardware or D-Bus is touched: the gate the handlers rely on is built
+    //! from two primitives we exercise directly here exactly as production
+    //! uses them — an `Arc<Semaphore>` permit held for the capture task's
+    //! lifetime (`verify_start`/`enroll_start` -> `try_acquire_owned()` ->
+    //! moved into the spawned task), and the `DeviceState` action token.
+
+    use super::{ActionKind, DeviceState};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    /// The core invariant: once a capture task holds the permit, a Stop (which
+    /// only clears `state.action`, modeled here by NOT releasing the permit)
+    /// cannot let any number of subsequent Starts enqueue a second capture.
+    /// The slot frees only when the task itself returns (permit drop).
+    #[tokio::test]
+    async fn churn_cannot_enqueue_second_capture() {
+        let slot = Arc::new(Semaphore::new(1));
+
+        // Start #1 succeeds; the permit now "lives in the spawned task".
+        let task_permit = slot
+            .clone()
+            .try_acquire_owned()
+            .expect("first start acquires the slot");
+
+        // A Start/Stop churn loop: every post-Stop Start must be refused while
+        // the prior task is still draining the worker.
+        for _ in 0..10_000 {
+            assert!(
+                slot.clone().try_acquire_owned().is_err(),
+                "Start must be rejected while a capture task still holds the slot"
+            );
+        }
+
+        // The capture task finally returns (sensor op drained): permit drops.
+        drop(task_permit);
+
+        // Only now can the next capture proceed — exactly one at a time.
+        assert!(
+            slot.clone().try_acquire_owned().is_ok(),
+            "slot must free once the prior task returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_most_one_capture_in_flight() {
+        let slot = Arc::new(Semaphore::new(1));
+        let _held = slot.clone().try_acquire_owned().unwrap();
+        assert_eq!(slot.available_permits(), 0);
+        assert!(slot.clone().try_acquire_owned().is_err());
+    }
+
+    /// The action token still serializes the D-Bus surface and survives stale
+    /// (abandoned-task) cleanup — unchanged by the fix, asserted so a future
+    /// refactor can't silently regress it.
+    #[test]
+    fn action_token_excludes_and_resists_stale_cleanup() {
+        let mut s = DeviceState::default();
+
+        // First action installs a token; the slot is now busy.
+        let t1 = s.start_action(ActionKind::Verify);
+        assert!(s.action.is_some());
+
+        // An abandoned predecessor's token (after a successor took over) must
+        // NOT clear the live slot.
+        let t2 = s.start_action(ActionKind::Enroll); // successor replaces t1
+        assert!(!s.end_action_if_owner(t1), "stale token must not clear");
+        assert!(s.action.is_some(), "successor still owns the slot");
+
+        // The real owner clears cleanly.
+        assert!(s.end_action_if_owner(t2));
+        assert!(s.action.is_none());
+    }
+
+    /// DEL-1: a Delete shares the single-in-flight slot with enroll/verify, so
+    /// `begin_delete`'s gate (action.is_some()) rejects concurrent deletes and
+    /// is mutually exclusive with an in-flight capture.
+    #[test]
+    fn delete_shares_the_single_action_slot() {
+        assert_eq!(ActionKind::Delete.as_str(), "delete");
+
+        let mut s = DeviceState::default();
+        // A delete installs a token; a second begin_delete would see Some(..).
+        let d = s.start_action(ActionKind::Delete);
+        assert!(s.action.is_some(), "delete holds the slot -> AlreadyInUse");
+        assert!(s.end_action_if_owner(d));
+        assert!(s.action.is_none());
+
+        // A live verify must also block a delete (begin_delete sees Some).
+        let _v = s.start_action(ActionKind::Verify);
+        assert!(s.action.is_some());
+    }
+}

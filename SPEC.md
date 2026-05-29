@@ -359,6 +359,7 @@ The R503 has 200 slots. The PC-side driver needs to maintain a `slot → usernam
 | Replay of captured response frames: attacker records a real `OK match=0` and tries to feed it back during a later verify | Response MAC is keyed on both the command counter and a per-response sequence number. A frame for command #42 is rejected during command #43 (counter mismatch); a frame for `seq=1` is rejected when `seq=0` is expected (seq mismatch) |
 | Replay of captured command frames: attacker records `C 42 verify 0 M ...` and tries to resend it | Firmware rejects with `ERR replay` whenever `incoming_counter <= last_seen`; `last_seen` is persisted in EEPROM and survives reboot |
 | Tampering with any frame field (counter, body, seq, MAC) | SipHash-2-4 is computed over a domain-separated input string covering all fields; bit-flips anywhere cause MAC verify to fail. Comparison is constant-time (XOR-OR loop) so timing channels don't leak which byte differed |
+| Counter-exhaustion brick: a key-holding/buggy peer (or a one-shot wire-MITM forging the unauthenticated `status counter=…` during `--resync`) drives the monotonic counter to `u64::MAX`, after which every command — including framed `unpair` recovery — needs `ctr > MAX` and is impossible | Both ends reserve the top `2^16` counters (`COUNTER_CEILING`, §13.4). The firmware refuses `ctr >= CEILING` with `ERR counter_ceiling` and commits nothing; the daemon refuses to emit or `--resync` to a ceiling-band counter, and `overflow-checks=true` stops a release-build `counter+1` wrap. The brick is structurally impossible (`fw=1.1+`; 2026-05-28 audit / DoS-2) |
 
 **What we explicitly do NOT defend against:**
 
@@ -434,7 +435,7 @@ In addition, `pair <key_hex>` is accepted unframed but **only when the Nano is u
 
 Every other command requires framing on a paired Nano. Unframed traffic to a paired Nano (other than the three above) gets rejected with `ERR mac_required`.
 
-**Boot banner** is plain unframed text: `R503FP READY fw=1.0 paired=<true|false>`. Followed (only if the R503 sensor is responsive) by the unframed `info` line. The daemon's open-time sync handshake drains both before sending its first framed command. The banner is intentionally unframed — at boot the daemon hasn't loaded its key yet, and the banner is advisory anyway (paired state is also exposed authoritatively via `status`).
+**Boot banner** is plain unframed text: `R503FP READY fw=1.1 paired=<true|false>`. Followed (only if the R503 sensor is responsive) by the unframed `info` line. The daemon's open-time sync handshake drains both before sending its first framed command. The banner is intentionally unframed — at boot the daemon hasn't loaded its key yet, and the banner is advisory anyway (paired state is also exposed authoritatively via `status`).
 
 ### 13.4 Counter rules
 
@@ -459,7 +460,9 @@ Every other command requires framing on a paired Nano. Unframed traffic to a pai
 | Moderate (20/day) | ~60 | ~73 |
 | Heavy (50/day) | ~150 | ~29 |
 
-The 64-bit counter itself wraps in geological time; not a concern.
+The 64-bit counter never wraps through *natural* use (geological time). It can, however, be **driven** to the top of the range by a malicious or buggy peer, which is the real concern — see the counter ceiling below.
+
+**Counter ceiling (`fw=1.1+` / `r503d 1.1.0+`).** Both ends reserve the top `2^16` counter values: any counter `>= COUNTER_CEILING` (`0xFFFF_FFFF_FFFF_0000`) is refused — the firmware answers `ERR counter_ceiling` and commits nothing; the daemon refuses to emit or resync to such a value. Without this, a single frame carrying `counter = u64::MAX` (from a key-holding peer, or a one-shot wire-MITM forging the unauthenticated `status counter=…` that `--resync` trusted) would commit `last_seen = MAX` to EEPROM. From then on every framed command — *including the framed `unpair` recovery, which is itself gated by the counter check* — would need `counter > MAX`, which is impossible: a permanent brick recoverable only by physical reflash-to-wipe. The ceiling makes the brick structurally impossible while leaving the entire usable range intact (lifetime max ≈ 1.6M advances, §13.4). The constant is mirrored byte-for-byte in `firmware/r503fp/framing.h` and `pcside/daemon/src/framing.rs` and pinned by a unit test. (Security audit 2026-05-28 / firmware DoS-2.)
 
 **False-positive CRC matches.** Per-cell, the chance of bit-rot producing a spuriously valid CRC is 1/65,536 (CRC-16). With 16 cells the union bound puts the boot-time "wrong cell mistaken for valid" probability at ~1/4096 — only relevant if EEPROM cells actually decay (multi-decade timescales for ATmega328P at room temperature). Detected mismatches would manifest as a counter regression, blocked by `ERR replay`; the daemon would surface it and the user re-pairs.
 
@@ -519,13 +522,16 @@ The 64-bit counter itself wraps in geological time; not a concern.
 | MAC mismatch on incoming command | Firmware constant-time compare fails | `ERR mac_invalid` (unauthenticated; no MAC to bind to) | Daemon logs and surfaces `framing_rejected` to caller (pam_fprintd typically retries) |
 | Frame too short / bad suffix / bad leader / bad mac hex / bad counter token | Firmware `verify_command_frame` returns the corresponding status | `ERR frame_too_short` / `bad_frame_suffix` / `bad_frame_leader` / `bad_mac_hex` / `bad_counter` | Same |
 | Counter regression (replay) | Firmware: `incoming <= last_seen` | `ERR replay` | Same. If chronic (host's state.json got rolled back), wipe + re-pair |
+| Counter in the reserved ceiling band (`>= COUNTER_CEILING`) | Firmware: ceiling check after the replay check, before EEPROM commit | `ERR counter_ceiling` (unframed; nothing committed) | A compliant daemon never sends this. Indicates a malicious/buggy peer; the channel is unharmed because nothing was persisted (`fw=1.1+`, 2026-05-28 audit / DoS-2) |
+| Host counter would reach the ceiling on send, or a `--resync` reads a ceiling-band `last_seen` | Daemon: `sensor::advance_counter` / `pairing::resync_target` | `SensorError::CounterExhausted` on send; `--resync` bails with a reflash-to-wipe hint | Reflash-to-wipe (`firmware/r503fp_wipe/`) + re-pair. Unreachable in normal use (lifetime max ≈ 1.6M advances) |
+| Over-cap echo: an unknown framed command long enough that `ERR unknown_command <echo>` would overflow the 128-byte response-MAC buffer | Firmware: the echoed verb is truncated to 40 bytes before framing | Framed `ERR unknown_command <truncated>` | None — previously this fell back to an unframed `ERR encode_overflow` after the counter was burned, desyncing the channel (`fw=1.1+`, 2026-05-28 audit / DoS-1) |
 | Unframed command sent to paired Nano | Firmware: line doesn't start with `C ` and isn't `ping`/`status` | `ERR mac_required` | Daemon shouldn't have done this; indicates a bug or a v1 client talking to a paired Nano |
 | Pair command on already-paired Nano | Firmware: `ee_is_paired() == true` | `ERR already_paired` | `r503d --unpair` first, then re-pair |
 | Unpair command on unpaired Nano | Firmware: `ee_is_paired() == false` | `ERR not_paired` | Nothing — already in desired state |
 | Daemon-side MAC mismatch on response | Daemon's `verify_response` fails | Daemon errors the in-flight call; logged | Caller (pam_fprintd) typically retries once |
 | Daemon-side counter or seq mismatch | Daemon checks `R <ctr> <seq>` vs expected | Same | Same |
 | Host key file lost (no backup) | Daemon start: `keystore::load_key()` returns None on a paired Nano | Daemon proceeds in unframed mode, all commands fail with `mac_required` from firmware; PAM sees errors | Reflash-to-wipe + re-pair (§13.5) |
-| Host state.json lost | Daemon start: `state::load()` returns Ok(None) | Daemon defaults to `next_cmd_counter = 1`. On first send, firmware accepts if `1 > last_seen`; otherwise `ERR replay` | Run `r503d --resync`: reads the Nano's `last_seen` from a `status` query and sets the host counter to `last_seen + 1`, no re-pair needed. `--status` prints a hint when it detects this state. |
+| Host state.json lost | Daemon start: `state::load()` returns Ok(None) | Daemon defaults to `next_cmd_counter = 1`. On first send, firmware accepts if `1 > last_seen`; otherwise `ERR replay` | Run `r503d --resync`: reads the Nano's `last_seen` from a `status` query and sets the host counter to `last_seen + 1`, no re-pair needed. `--status` prints a hint when it detects this state. A reported `last_seen` in the reserved ceiling band is refused (a MITM can't drive the host counter into the brick zone). |
 | Nano EEPROM ring all-CRC-fail (extreme bit-rot or fresh chip without prior pairing) | Firmware scan returns `any_valid=false` | `last_seen` reads as 0; daemon's counter > 0 will be accepted | Self-healing on first successful command |
 | R503 sensor doesn't respond on first `info` after boot | Firmware: `finger.verifyPassword()` returns false | Framed `ERR sensor_unreachable` | Daemon retries; usually transient (SoftwareSerial timing on cold boot) |
 | Inbound line exceeds 4096 bytes with no newline (glitchy firmware, or a co-opener that slipped past the exclusive lock) | Daemon: `read_line` cap | `SensorError::Protocol` after clearing the RX buffer + flushing the kernel input queue | Caller decides to retry or fail; bounds RAM growth (2026-05-28 audit / M1) |
@@ -539,6 +545,8 @@ The 64-bit counter itself wraps in geological time; not a concern.
 **Hard cutover, no compatibility window.** A "downgrade to plaintext" capability would itself be an attack vector — strip it from the protocol entirely. v1 was an early-development prototype with one known deployment (the author's desk) at the time of cutover; no installed base to preserve.
 
 **Versioning:** firmware `fw=0.4` → `fw=1.0`, daemon `r503d 0.1.0` → `1.0.0`. Mixed versions detect the mismatch at sensor open: the paired firmware rejects any unframed command other than `ping`/`status` with `ERR mac_required`, and the v1 daemon doesn't know how to frame, so the failure is loud and immediate.
+
+The counter-ceiling hardening (§13.4, 2026-05-28 audit / DoS-2) bumped both to `fw=1.1` / `r503d 1.1.0`. It is a pure addition — no wire-grammar change and no EEPROM-layout change (`fmt` stays `2`), so it forces no re-pair and the two ends interoperate across the bump in either direction (an old daemon never emits a ceiling-band counter; new firmware just gains a guard that never fires in normal use). The bumped `fw=1.1` string only lets the host tell ceiling-aware firmware apart.
 
 **EEPROM format version** also bumps: `fmt=1` (used briefly during Milestone C development with CRC-8) → `fmt=2` (CRC-16-CCITT cells). Any Nano with old-format EEPROM contents fails `ee_is_paired()` on the new firmware and is silently treated as unpaired — clean forced re-pair on first boot of `fw=1.0`.
 
@@ -554,6 +562,7 @@ The 64-bit counter itself wraps in geological time; not a concern.
 - `r503d --resync`: recover a lost/rolled-back `state.json` without re-pairing — reads the Nano's `last_seen` from a `status` query and sets the host counter to `last_seen + 1` (`pairing::run_resync`). `--status` prints a hint when it detects paired-with-key-but-no-state.
 - USB unplug/replug recovery: `SensorActor` reopens the port, re-applies auth (key + counter reloaded from state.json), continues. Tested implicitly during dev.
 - 2026-05-28 adversarial-audit hardening: root-only `/dev/r503` + explicit exclusive open (H1), bounded `read_line` (M1), `O_NOFOLLOW`/owner/mode guards on key load (M2), `deny_unknown_fields` + `0600` mode-verify on JSON load (M3), firmware body-length reject (M4), pinned `PATH` in `reseal-tpm.sh` (M5), plus the LOW-severity hygiene items. One commit per validated finding; see the validation report.
+- 2026-05-28 multi-agent hunt (`fw=1.1` / `r503d 1.1.0`): counter-ceiling guard on both ends against the counter-exhaustion brick + the release-build `counter+1` wrap (DoS-2); firmware echo truncation so an over-cap `ERR unknown_command` can't desync the channel (DoS-1); capture-slot semaphore bounding in-flight enroll/verify work and action-gated delete paths against local-user sensor DoS; `cmd_labeled` so a pairing reply-timeout never leaks the key/MAC into logs. One commit per finding.
 
 **Implementation footprint (actual, not the original budget):**
 
@@ -573,7 +582,7 @@ The 64-bit counter itself wraps in geological time; not a concern.
 | `sensor.rs` / `sensor_actor.rs` / `main.rs` deltas | ~150 |
 | **Daemon total added** | **~1,065** |
 
-**Footprint on the Nano (`fw=1.0`):** 70% of flash (21,674 / 30,720 bytes), 36% of SRAM (741 / 2,048 bytes) — measured with `arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328` after the 2026-05-28 audit hardening (the body-length reject of finding M4 added the handful of bytes over the original ~21,290).
+**Footprint on the Nano (`fw=1.1`):** 70% of flash (21,794 / 30,720 bytes), 36% of SRAM (741 / 2,048 bytes) — measured with `arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328` after the 2026-05-28 audit hardening (the body-length reject of finding M4, plus the DoS-2 counter-ceiling guard and the DoS-1 echo truncation, added the handful of bytes over the original ~21,290).
 
 **Not implemented, on the roadmap (§13.11):**
 - `degraded=true` banner field for EEPROM-ring-all-corrupted edge case.
@@ -684,7 +693,7 @@ Wall-clock: ~90 seconds. Enrolled fingers are preserved — templates live in th
 **What's still out of scope.**
 
 - PCR policy authorization (signed updatable policies, à la systemd-cryptenroll) — would let kernel updates that *do* shift PCRs (with `--seal-tpm-pcrs=7,11`) survive without a reseal. Roadmap; the existing `reseal-tpm.sh` ceremony is the workaround.
-- TPM PIN (userAuth-bound seal). The operator could attach an additional `userAuth` value so that a thief who steals the running machine *and* the disk still needs a passphrase, with the TPM's own anti-hammering protection. The canonical TPM2 pattern is a chained `PolicyPCR + PolicyAuthValue` policy. UX cost is a passphrase prompt at every daemon boot (i.e. every reboot). Roadmap; not in `fw=1.0` / `r503d 1.0.0`.
+- TPM PIN (userAuth-bound seal). The operator could attach an additional `userAuth` value so that a thief who steals the running machine *and* the disk still needs a passphrase, with the TPM's own anti-hammering protection. The canonical TPM2 pattern is a chained `PolicyPCR + PolicyAuthValue` policy. UX cost is a passphrase prompt at every daemon boot (i.e. every reboot). Roadmap; not in `r503d 1.1.0`.
 
 ---
 
