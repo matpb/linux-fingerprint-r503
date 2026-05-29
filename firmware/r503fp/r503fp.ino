@@ -18,6 +18,13 @@ const uint8_t PIN_RX = 2;
 const uint8_t PIN_TX = 3;
 const uint8_t PIN_WAKE = 4;
 
+// Aura ring color index for the R503-RGB variant's green LED. The Adafruit
+// library only defines RED/BLUE/PURPLE (0x01/0x02/0x03) — the bi-color R503's
+// full palette — so green (0x04) is passed as a raw index. Confirmed lighting
+// vibrant green on this unit, so it's an R503-RGB. On a bi-color R503 this
+// index does nothing; fall back to FINGERPRINT_LED_PURPLE there.
+#define FINGERPRINT_LED_GREEN 0x04
+
 SoftwareSerial sensorSerial(PIN_RX, PIN_TX);
 Adafruit_Fingerprint finger(&sensorSerial);
 
@@ -160,7 +167,7 @@ void handleEnroll(int slot) {
   p = finger.storeModel((uint16_t)slot);
   if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR store_failed=")); g_out->println(p); return; }
 
-  finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_BLUE, 5);
+  finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_GREEN, 5);
   g_out->print(F("OK enrolled="));
   g_out->println(slot);
 }
@@ -179,7 +186,7 @@ void handleVerify() {
     return;
   }
   if (p != FINGERPRINT_OK) { finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0); g_out->print(F("ERR search_failed=")); g_out->println(p); return; }
-  finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_BLUE, 3);
+  finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 50, FINGERPRINT_LED_GREEN, 3);
   g_out->print(F("OK match="));
   g_out->print(finger.fingerID);
   g_out->print(F(" confidence="));
