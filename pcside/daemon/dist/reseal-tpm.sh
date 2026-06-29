@@ -30,6 +30,21 @@ set -euo pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# arduino-cli stores installed cores (e.g. arduino:avr) under its data dir,
+# default $HOME/.arduino15. Under sudo we run as root, whose ~/.arduino15 is
+# empty, so `compile` fails with "Platform 'arduino:avr' not found". The core
+# was installed by the invoking user, so point arduino-cli at THAT user's data
+# and sketchbook dirs unless the caller already set them. Mirrors how
+# find_arduino_cli() falls back to $SUDO_USER's ~/.local/bin for the binary.
+if [[ -n "${SUDO_USER:-}" ]]; then
+    _user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    if [[ -n "$_user_home" ]]; then
+        : "${ARDUINO_DIRECTORIES_DATA:=$_user_home/.arduino15}"
+        : "${ARDUINO_DIRECTORIES_USER:=$_user_home/Arduino}"
+        export ARDUINO_DIRECTORIES_DATA ARDUINO_DIRECTORIES_USER
+    fi
+fi
+
 # --pcrs <list>  optional PCR list (default 7). Passed through to
 #                r503d --reseal-tpm. Use 7,11 to additionally bind UKI
 #                (kernel+initrd) measurement, etc. SPEC §13.12.
@@ -63,7 +78,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 DIST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "$DIST_DIR/../.." && pwd)"
+REPO_ROOT="$(cd -- "$DIST_DIR/../../.." && pwd)"
 FW_DIR="$REPO_ROOT/firmware"
 
 WIPE_SKETCH="$FW_DIR/r503fp_wipe"

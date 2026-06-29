@@ -402,8 +402,17 @@ pub fn run_reseal_tpm(port_override: Option<&str>, seal_tpm_pcrs: Option<&str>) 
         Some(p) => p.to_string(),
         None => sensor::find_port().context("locating R503 serial port")?,
     };
-    let mut link = Link::open(&port_path)?;
-    let pre = parse_status(&link.cmd("status", Duration::from_secs(1))?)?;
+    // Probe the Nano's pairing state, then DROP the port before `run_pair`:
+    // run_pair re-opens the same device with `.exclusive(true)` (TIOCEXCL +
+    // flock LOCK_EX), so holding `link` open across the call would deadlock the
+    // reseal against its own exclusive lock — "Unable to acquire exclusive lock
+    // on serial port". It only bites when the Nano is freshly wiped
+    // (pre.paired == false), i.e. every real reseal. Scoping `link` to this
+    // block releases the fd (and the lock) as soon as the status read returns.
+    let pre = {
+        let mut link = Link::open(&port_path)?;
+        parse_status(&link.cmd("status", Duration::from_secs(1))?)?
+    };
     if pre.paired {
         bail!(
             "Nano still reports paired=true — the reseal flow expects a wiped Nano.\n\
