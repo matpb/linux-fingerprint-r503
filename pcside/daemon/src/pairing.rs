@@ -317,7 +317,7 @@ pub fn run_pair(
 
     // Wire bytes carry the fresh 128-bit key; the label must not, so a reply
     // timeout cannot leak the key into the error chain (audit L-pairing-key).
-    let reply = link.cmd_labeled(&format!("pair {}", &*key_h), "pair", Duration::from_secs(2))?;
+    let reply = link.cmd_labeled(&format!("pair {}", *key_h), "pair", Duration::from_secs(2))?;
     if reply != "OK paired" {
         bail!("Nano refused pair: {:?}", reply);
     }
@@ -719,7 +719,7 @@ mod tests {
         // Simulate the exact `pair` call site: wire = "pair <32-hex-key>".
         let key = keystore::generate_key().unwrap();
         let key_h = keystore::key_hex(&key);
-        let wire = format!("pair {}", &*key_h);
+        let wire = format!("pair {}", *key_h);
 
         let msg = timeout_context("pair");
 
