@@ -11,7 +11,7 @@
 //!   - Bootloader / kernel substitution that changes PCR7 fails `TPM2_Unseal`.
 //!
 //! Failure mode on PCR7 mismatch: refuse to operate, instruct the operator to
-//! run the reseal ceremony (`sudo dist/reseal-tpm.sh`). No plaintext fallback —
+//! run the reseal ceremony (`sudo bash pcside/daemon/dist/reseal-tpm.sh`). No plaintext fallback —
 //! that would defeat the point.
 
 #![allow(dead_code)] // sealed_blob_exists / current_pcr7_hex / hex_encode are
@@ -54,6 +54,25 @@ pub const TPM_DEVICE: &str = "/dev/tpmrm0";
 ///     between magic and pub_len. Caller chooses which PCRs to bind.
 const FILE_MAGIC_V1: &[u8; 8] = b"R503TPM\x01";
 const FILE_MAGIC_V2: &[u8; 8] = b"R503TPM\x02";
+/// `\x03`: same body as `\x01` (no PCR bytes), TPM-bound with no policy.
+const FILE_MAGIC_V3: &[u8; 8] = b"R503TPM\x03";
+
+/// Explicit rather than an empty PCR vec, so "no policy" isn't confusable
+/// with a parse bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealPolicy {
+    Pcrs(Vec<u8>),
+    None,
+}
+
+impl std::fmt::Display for SealPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SealPolicy::Pcrs(pcrs) => write!(f, "PCRs {:?}", pcrs),
+            SealPolicy::None => write!(f, "none"),
+        }
+    }
+}
 
 /// Default PCR binding for legacy v1 blobs and the no-flag pair path.
 /// PCR7 = Secure Boot policy + keys (SPEC §13.12).
@@ -87,7 +106,7 @@ pub fn seal_key(key: &[u8; 16]) -> Result<Vec<u8>> {
 ///
 /// Each additional PCR tightens the seal and invalidates it on the
 /// corresponding update event (kernel bump → PCR11 changes → reseal needed).
-/// `dist/reseal-tpm.sh` carries `--pcrs <list>` to the reseal flow.
+/// `pcside/daemon/dist/reseal-tpm.sh` carries `--pcrs <list>` to the reseal flow.
 pub fn seal_key_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<Vec<u8>> {
     validate_pcrs(pcrs)?;
     let mut ctx = open_context()?;
@@ -133,7 +152,55 @@ pub fn seal_key_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<Vec<u8>> {
     ctx.flush_context(SessionHandle::from(hmac).into()).ok();
     let (pub_bytes, priv_bytes) = attempt?;
 
-    Ok(serialize_blob(pcrs, &pub_bytes, &priv_bytes))
+    Ok(serialize_blob(
+        &SealPolicy::Pcrs(pcrs.to_vec()),
+        &pub_bytes,
+        &priv_bytes,
+    ))
+}
+
+/// Seal to the TPM with no PCR policy — bound to this TPM, not boot state.
+/// `user_with_auth(true)` gives an empty-password USER role; no policy path.
+pub fn seal_key_no_policy(key: &[u8; 16]) -> Result<Vec<u8>> {
+    let mut ctx = open_context()?;
+
+    let hmac = start_hmac_session(&mut ctx)?;
+    let attempt: Result<(Vec<u8>, Vec<u8>)> = (|| {
+        ctx.set_sessions((Some(hmac), None, None));
+        let primary = ctx
+            .create_primary(Hierarchy::Owner, srk_template()?, None, None, None, None)
+            .context("creating primary key on Owner hierarchy")?;
+
+        let sealed_pub = sealed_object_template_no_policy()?;
+
+        let sensitive = SensitiveData::try_from(key.to_vec())
+            .map_err(|e| anyhow!("wrapping 16 bytes into SensitiveData: {:?}", e))?;
+
+        let created = ctx
+            .create(
+                primary.key_handle,
+                sealed_pub,
+                None,
+                Some(sensitive),
+                None,
+                None,
+            )
+            .context("creating sealed object under primary")?;
+
+        let pub_bytes: Vec<u8> = created
+            .out_public
+            .marshall()
+            .context("marshalling out_public")?;
+        let priv_bytes: Vec<u8> = created.out_private.value().to_vec();
+
+        ctx.flush_context(primary.key_handle.into()).ok();
+        Ok((pub_bytes, priv_bytes))
+    })();
+
+    ctx.flush_context(SessionHandle::from(hmac).into()).ok();
+    let (pub_bytes, priv_bytes) = attempt?;
+
+    Ok(serialize_blob(&SealPolicy::None, &pub_bytes, &priv_bytes))
 }
 
 /// Unseal the key from a previously-sealed blob, against the current PCR7
@@ -144,17 +211,31 @@ pub fn seal_key_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<Vec<u8>> {
 /// it must not be unwrapped into a bare `[u8; 16]` by callers (crypto-
 /// posture review item #2).
 pub fn unseal_key(blob: &[u8]) -> Result<Zeroizing<[u8; 16]>> {
-    let (pcrs, pub_bytes, priv_bytes) = deserialize_blob(blob)?;
+    let (policy, pub_bytes, priv_bytes) = deserialize_blob(blob)?;
     let sealed_public =
         Public::unmarshall(&pub_bytes).context("unmarshalling stored sealed Public")?;
     let sealed_private = Private::try_from(priv_bytes)
         .map_err(|e| anyhow!("rebuilding Private from blob bytes: {:?}", e))?;
 
     let mut ctx = open_context()?;
-    let pcr_sel = pcr_selection_for(&pcrs)?;
+    match policy {
+        SealPolicy::Pcrs(pcrs) => {
+            unseal_with_pcr_policy(&mut ctx, &pcrs, sealed_public, sealed_private)
+        }
+        SealPolicy::None => unseal_with_no_policy(&mut ctx, sealed_public, sealed_private),
+    }
+}
 
-    let hmac = start_hmac_session(&mut ctx)?;
-    let policy = start_policy_session(&mut ctx)?;
+fn unseal_with_pcr_policy(
+    ctx: &mut TpmContext,
+    pcrs: &[u8],
+    sealed_public: Public,
+    sealed_private: Private,
+) -> Result<Zeroizing<[u8; 16]>> {
+    let pcr_sel = pcr_selection_for(pcrs)?;
+
+    let hmac = start_hmac_session(ctx)?;
+    let policy = start_policy_session(ctx)?;
 
     let attempt: Result<Zeroizing<[u8; 16]>> = (|| {
         ctx.set_sessions((Some(hmac), None, None));
@@ -177,13 +258,13 @@ pub fn unseal_key(blob: &[u8]) -> Result<Zeroizing<[u8; 16]>> {
             Digest::try_from(Vec::<u8>::new()).unwrap(),
             pcr_sel.clone(),
         )
-        .context("PolicyPCR — TPM_RC_POLICY_FAIL means PCR7 changed since sealing")?;
+        .context("PolicyPCR — TPM_RC_POLICY_FAIL means bound PCRs changed since sealing")?;
 
         ctx.set_sessions((Some(policy), None, None));
         let unsealed = ctx.unseal(loaded.into()).context(
             "Unseal — PCR policy mismatch; \
                  boot state changed since sealing. \
-                 Run `sudo dist/reseal-tpm.sh` to recover.",
+                 Run `sudo bash pcside/daemon/dist/reseal-tpm.sh` to recover.",
         )?;
 
         ctx.set_sessions((Some(hmac), None, None));
@@ -200,6 +281,46 @@ pub fn unseal_key(blob: &[u8]) -> Result<Zeroizing<[u8; 16]>> {
     })();
 
     ctx.flush_context(SessionHandle::from(policy).into()).ok();
+    ctx.flush_context(SessionHandle::from(hmac).into()).ok();
+
+    attempt
+}
+
+/// v3 blobs: no policy session, unseal under the HMAC session with empty
+/// USER auth (matches `sealed_object_template_no_policy`).
+fn unseal_with_no_policy(
+    ctx: &mut TpmContext,
+    sealed_public: Public,
+    sealed_private: Private,
+) -> Result<Zeroizing<[u8; 16]>> {
+    let hmac = start_hmac_session(ctx)?;
+
+    let attempt: Result<Zeroizing<[u8; 16]>> = (|| {
+        ctx.set_sessions((Some(hmac), None, None));
+        let primary = ctx
+            .create_primary(Hierarchy::Owner, srk_template()?, None, None, None, None)
+            .context("re-creating primary key (TPM owner seed mismatch?)")?;
+
+        let loaded = ctx
+            .load(primary.key_handle, sealed_private, sealed_public)
+            .context("loading sealed object under primary")?;
+
+        let unsealed = ctx
+            .unseal(loaded.into())
+            .context("Unseal (no-policy blob) failed")?;
+
+        ctx.flush_context(loaded.into()).ok();
+        ctx.flush_context(primary.key_handle.into()).ok();
+
+        let bytes = unsealed.value();
+        if bytes.len() != 16 {
+            bail!("unsealed payload is {} bytes, expected 16", bytes.len());
+        }
+        let mut out = Zeroizing::new([0u8; 16]);
+        out.copy_from_slice(bytes);
+        Ok(out)
+    })();
+
     ctx.flush_context(SessionHandle::from(hmac).into()).ok();
 
     attempt
@@ -439,19 +560,41 @@ fn sealed_object_template(policy_digest: Digest) -> Result<Public> {
         .context("building sealed-object Public")
 }
 
-fn serialize_blob(pcrs: &[u8], pub_bytes: &[u8], priv_bytes: &[u8]) -> Vec<u8> {
+fn sealed_object_template_no_policy() -> Result<Public> {
+    // No auth_policy: `admin_with_policy(false)` + `user_with_auth(true)`
+    // means an empty-password USER session authorizes the unseal.
+    let attrs = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_no_da(true)
+        .with_admin_with_policy(false)
+        .with_user_with_auth(true)
+        .build()
+        .context("sealed object attributes (no policy)")?;
+
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::KeyedHash)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(attrs)
+        .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
+        .with_keyed_hash_unique_identifier(Default::default())
+        .build()
+        .context("building sealed-object Public (no policy)")
+}
+
+fn serialize_blob(policy: &SealPolicy, pub_bytes: &[u8], priv_bytes: &[u8]) -> Vec<u8> {
     // PCR7-only seals stay on the v1 magic so existing key.tpm files keep
-    // round-tripping. Anything else gets the v2 magic + explicit PCR list.
-    let use_v2 = pcrs != DEFAULT_PCRS;
+    // round-tripping. Other PCR sets get v2; no policy gets v3.
+    let (magic, pcr_bytes): (&[u8; 8], Option<&[u8]>) = match policy {
+        SealPolicy::Pcrs(pcrs) if pcrs.as_slice() == DEFAULT_PCRS => (FILE_MAGIC_V1, None),
+        SealPolicy::Pcrs(pcrs) => (FILE_MAGIC_V2, Some(pcrs.as_slice())),
+        SealPolicy::None => (FILE_MAGIC_V3, None),
+    };
     let mut out = Vec::with_capacity(
-        FILE_MAGIC_V1.len()
-            + 8
-            + pub_bytes.len()
-            + priv_bytes.len()
-            + if use_v2 { 1 + pcrs.len() } else { 0 },
+        magic.len() + 8 + pub_bytes.len() + priv_bytes.len() + pcr_bytes.map_or(0, |p| 1 + p.len()),
     );
-    out.extend_from_slice(if use_v2 { FILE_MAGIC_V2 } else { FILE_MAGIC_V1 });
-    if use_v2 {
+    out.extend_from_slice(magic);
+    if let Some(pcrs) = pcr_bytes {
         out.push(pcrs.len() as u8);
         out.extend_from_slice(pcrs);
     }
@@ -462,7 +605,7 @@ fn serialize_blob(pcrs: &[u8], pub_bytes: &[u8], priv_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-fn deserialize_blob(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+fn deserialize_blob(blob: &[u8]) -> Result<(SealPolicy, Vec<u8>, Vec<u8>)> {
     // Defensive cap. Real TPM-marshalled fields here are ~150 B (Public) and
     // ~100 B (Private); a 64 KB cap is generous and bounds any attempt to
     // make us preallocate a multi-GB buffer from a hostile file. Crypto-
@@ -472,8 +615,8 @@ fn deserialize_blob(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     if blob.len() < FILE_MAGIC_V1.len() + 8 {
         bail!("sealed blob too short ({} bytes)", blob.len());
     }
-    let (pcrs, mut off) = if &blob[..FILE_MAGIC_V1.len()] == FILE_MAGIC_V1 {
-        (DEFAULT_PCRS.to_vec(), FILE_MAGIC_V1.len())
+    let (policy, mut off) = if &blob[..FILE_MAGIC_V1.len()] == FILE_MAGIC_V1 {
+        (SealPolicy::Pcrs(DEFAULT_PCRS.to_vec()), FILE_MAGIC_V1.len())
     } else if &blob[..FILE_MAGIC_V2.len()] == FILE_MAGIC_V2 {
         let mut off = FILE_MAGIC_V2.len();
         if off >= blob.len() {
@@ -490,7 +633,9 @@ fn deserialize_blob(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let pcrs = blob[off..off + pcr_count].to_vec();
         off += pcr_count;
         validate_pcrs(&pcrs)?;
-        (pcrs, off)
+        (SealPolicy::Pcrs(pcrs), off)
+    } else if &blob[..FILE_MAGIC_V3.len()] == FILE_MAGIC_V3 {
+        (SealPolicy::None, FILE_MAGIC_V3.len())
     } else {
         bail!("sealed blob magic mismatch — file isn't a key.tpm produced by this daemon");
     };
@@ -533,7 +678,13 @@ fn deserialize_blob(blob: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         );
     }
     let priv_bytes = blob[off..off + priv_len].to_vec();
-    Ok((pcrs, pub_bytes, priv_bytes))
+    Ok((policy, pub_bytes, priv_bytes))
+}
+
+/// Decode just the seal policy from a blob, without touching the TPM.
+/// Used by `--reseal-policy` to report the old policy before resealing.
+pub fn policy_of_blob(blob: &[u8]) -> Result<SealPolicy> {
+    deserialize_blob(blob).map(|(policy, _, _)| policy)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -552,14 +703,18 @@ mod tests {
     fn blob_roundtrip_v1_default_pcrs() {
         let pub_bytes = vec![1, 2, 3, 4, 5];
         let priv_bytes = vec![9, 8, 7];
-        let blob = serialize_blob(DEFAULT_PCRS, &pub_bytes, &priv_bytes);
+        let blob = serialize_blob(
+            &SealPolicy::Pcrs(DEFAULT_PCRS.to_vec()),
+            &pub_bytes,
+            &priv_bytes,
+        );
         assert_eq!(
             &blob[..FILE_MAGIC_V1.len()],
             FILE_MAGIC_V1,
             "default PCRs should still use v1 magic for backward compat"
         );
-        let (pcrs, p, q) = deserialize_blob(&blob).unwrap();
-        assert_eq!(pcrs, DEFAULT_PCRS);
+        let (policy, p, q) = deserialize_blob(&blob).unwrap();
+        assert_eq!(policy, SealPolicy::Pcrs(DEFAULT_PCRS.to_vec()));
         assert_eq!(p, pub_bytes);
         assert_eq!(q, priv_bytes);
     }
@@ -569,35 +724,63 @@ mod tests {
         let pcrs = vec![0u8, 4, 7, 11];
         let pub_bytes = vec![1, 2, 3, 4, 5];
         let priv_bytes = vec![9, 8, 7];
-        let blob = serialize_blob(&pcrs, &pub_bytes, &priv_bytes);
+        let blob = serialize_blob(&SealPolicy::Pcrs(pcrs.clone()), &pub_bytes, &priv_bytes);
         assert_eq!(
             &blob[..FILE_MAGIC_V2.len()],
             FILE_MAGIC_V2,
             "non-default PCRs should use v2 magic"
         );
-        let (got_pcrs, p, q) = deserialize_blob(&blob).unwrap();
-        assert_eq!(got_pcrs, pcrs);
+        let (policy, p, q) = deserialize_blob(&blob).unwrap();
+        assert_eq!(policy, SealPolicy::Pcrs(pcrs));
+        assert_eq!(p, pub_bytes);
+        assert_eq!(q, priv_bytes);
+    }
+
+    #[test]
+    fn blob_roundtrip_v3_no_policy() {
+        let pub_bytes = vec![1, 2, 3, 4, 5];
+        let priv_bytes = vec![9, 8, 7];
+        let blob = serialize_blob(&SealPolicy::None, &pub_bytes, &priv_bytes);
+        assert_eq!(
+            &blob[..FILE_MAGIC_V3.len()],
+            FILE_MAGIC_V3,
+            "no-policy seals should use v3 magic"
+        );
+        let (policy, p, q) = deserialize_blob(&blob).unwrap();
+        assert_eq!(policy, SealPolicy::None);
         assert_eq!(p, pub_bytes);
         assert_eq!(q, priv_bytes);
     }
 
     #[test]
     fn blob_rejects_wrong_magic() {
-        let mut blob = serialize_blob(DEFAULT_PCRS, &[1, 2, 3], &[4, 5, 6]);
+        let mut blob = serialize_blob(
+            &SealPolicy::Pcrs(DEFAULT_PCRS.to_vec()),
+            &[1, 2, 3],
+            &[4, 5, 6],
+        );
         blob[0] = b'X';
         assert!(deserialize_blob(&blob).is_err());
     }
 
     #[test]
     fn blob_rejects_truncated_pub() {
-        let blob = serialize_blob(DEFAULT_PCRS, &[1, 2, 3, 4], &[5, 6]);
+        let blob = serialize_blob(
+            &SealPolicy::Pcrs(DEFAULT_PCRS.to_vec()),
+            &[1, 2, 3, 4],
+            &[5, 6],
+        );
         let truncated = &blob[..blob.len() - 5];
         assert!(deserialize_blob(truncated).is_err());
     }
 
     #[test]
     fn blob_rejects_trailing_garbage() {
-        let mut blob = serialize_blob(DEFAULT_PCRS, &[1, 2, 3], &[4, 5]);
+        let mut blob = serialize_blob(
+            &SealPolicy::Pcrs(DEFAULT_PCRS.to_vec()),
+            &[1, 2, 3],
+            &[4, 5],
+        );
         blob.push(0xff);
         assert!(deserialize_blob(&blob).is_err());
     }

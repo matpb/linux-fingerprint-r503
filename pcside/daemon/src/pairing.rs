@@ -357,7 +357,7 @@ pub fn run_pair(
         );
         println!(
             "plaintext key + .bak removed — recovery via \
-             `sudo dist/reseal-tpm.sh --pcrs {}` if any bound PCR changes",
+             `sudo bash pcside/daemon/dist/reseal-tpm.sh --pcrs {}` if any bound PCR changes",
             pcrs_label
         );
     } else {
@@ -377,7 +377,7 @@ pub fn run_pair(
 
 /// Reseal recovery flow (SPEC §13.12). Assumes the Nano's EEPROM has been
 /// wiped externally (reflash-to-wipe + reflash of main firmware) — this is
-/// what `dist/reseal-tpm.sh` does before invoking us.
+/// what `pcside/daemon/dist/reseal-tpm.sh` does before invoking us.
 ///
 /// Difference vs `--pair --seal-tpm`: also purges any stale plaintext key,
 /// stale TPM blob, and stale counter state up front. The old host key is
@@ -416,7 +416,7 @@ pub fn run_reseal_tpm(port_override: Option<&str>, seal_tpm_pcrs: Option<&str>) 
     if pre.paired {
         bail!(
             "Nano still reports paired=true — the reseal flow expects a wiped Nano.\n\
-             Run `dist/reseal-tpm.sh` instead of calling --reseal-tpm directly, \
+             Run `pcside/daemon/dist/reseal-tpm.sh` instead of calling --reseal-tpm directly, \
              or reflash firmware/r503fp_wipe/ + firmware/r503fp/ manually first."
         );
     }
@@ -428,6 +428,66 @@ pub fn run_reseal_tpm(port_override: Option<&str>, seal_tpm_pcrs: Option<&str>) 
 
     // Now the normal pair-with-seal path.
     run_pair(port_override, /*seal_tpm=*/ true, seal_tpm_pcrs)
+}
+
+/// Re-seal the EXISTING host key under a new policy, in place. Never touches
+/// the Nano. `new_pcrs = None` means no PCR policy (the new default).
+pub fn run_reseal_policy(new_pcrs: Option<&[u8]>) -> Result<()> {
+    use subtle::ConstantTimeEq;
+
+    let (key, source) = keystore::load_key_with_source()
+        .map_err(|e| {
+            // Keep the source error: a transient TPM fault must not read as a
+            // policy mismatch, which would send the operator to a destructive ceremony.
+            e.context(
+                "existing key.tpm cannot be unsealed; --reseal-policy cannot recover it. \
+                 If the cause below is a PCR policy mismatch, run \
+                 `sudo bash pcside/daemon/dist/reseal-tpm.sh` (that ceremony wipes and \
+                 re-pairs the Nano); any other cause should be fixed without re-pairing.",
+            )
+        })?
+        .ok_or_else(|| anyhow::anyhow!("no host key present — nothing to reseal; pair first"))?;
+
+    let old_policy_label = match source {
+        keystore::KeySource::Plaintext => "plaintext (no TPM seal)".to_string(),
+        keystore::KeySource::Tpm => {
+            let old_blob = std::fs::read(keystore::KEY_TPM_PATH)
+                .with_context(|| format!("re-reading {}", keystore::KEY_TPM_PATH))?;
+            crate::tpm::policy_of_blob(&old_blob)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        }
+    };
+
+    let new_blob = match new_pcrs {
+        Some(pcrs) => crate::tpm::seal_key_with_pcrs(&key, pcrs)
+            .with_context(|| format!("sealing key to TPM (PCRs {:?})", pcrs))?,
+        None => crate::tpm::seal_key_no_policy(&key).context("sealing key to TPM (no policy)")?,
+    };
+
+    // Verify BEFORE touching disk — a bug here must not brick the existing key.tpm.
+    let reunsealed = crate::tpm::unseal_key(&new_blob)
+        .context("verifying freshly-sealed blob — old key.tpm left untouched")?;
+    if !bool::from(reunsealed.ct_eq(&*key)) {
+        bail!(
+            "reseal verification mismatch: new blob unseals to a different key. \
+             Refusing to write — old key.tpm is untouched."
+        );
+    }
+
+    keystore::persist_sealed_blob(&new_blob).context("writing resealed key.tpm")?;
+    if source == keystore::KeySource::Plaintext {
+        keystore::delete_key().ok();
+    }
+
+    let new_policy_label = match new_pcrs {
+        Some(pcrs) => format!("PCRs {:?}", pcrs),
+        None => "none".to_string(),
+    };
+    println!("old policy: {}", old_policy_label);
+    println!("new policy: {}", new_policy_label);
+    println!("resealed key written to {}", keystore::KEY_TPM_PATH);
+    Ok(())
 }
 
 /// Compute the post-resync `next_cmd_counter` from the Nano's reported

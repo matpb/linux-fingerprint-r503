@@ -86,18 +86,19 @@ struct Args {
     status: bool,
 
     /// One-shot: recover a lost/rolled-back state.json without re-pairing.
-    /// Reads the Nano's last_seen counter and sets the host's next counter to
-    /// last_seen+1. Requires the host key to still exist. Stop the daemon
-    /// first: `systemctl stop r503d && r503d --resync` (SPEC §13.11).
-    #[arg(long, conflicts_with_all = ["pair", "unpair", "status", "reseal_tpm"])]
+    /// Requires the host key to still exist (SPEC §13.11).
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "status", "reseal_tpm", "reseal_policy"])]
     resync: bool,
 
-    /// One-shot: recover from a PCR7 policy change (kernel update, Secure Boot
-    /// edit, hardware move). Assumes the Nano EEPROM has been externally wiped
-    /// — the wrapper script `dist/reseal-tpm.sh` handles that. Re-pairs the
-    /// Nano with a fresh key and seals it to current PCR7.
-    #[arg(long, conflicts_with_all = ["pair", "unpair", "status", "resync"])]
+    /// One-shot: recover from a Secure Boot database update (fwupd dbx/db/KEK;
+    /// see `fwupdmgr get-history`). Wipes+re-pairs via `dist/reseal-tpm.sh`.
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "status", "resync", "reseal_policy"])]
     reseal_tpm: bool,
+
+    /// One-shot: re-seal the EXISTING host key under a new policy in place.
+    /// Never touches the Nano. Default (or `none`) drops PCR binding.
+    #[arg(long, conflicts_with_all = ["pair", "unpair", "status", "resync", "reseal_tpm"])]
+    reseal_policy: bool,
 }
 
 fn default_storage_path(session: bool) -> PathBuf {
@@ -148,6 +149,14 @@ async fn main() -> anyhow::Result<()> {
     if args.reseal_tpm {
         return pairing::run_reseal_tpm(args.port.as_deref(), args.seal_tpm_pcrs.as_deref());
     }
+    if args.reseal_policy {
+        let new_pcrs: Option<Vec<u8>> = match args.seal_tpm_pcrs.as_deref() {
+            None => None,
+            Some(s) if s.trim().eq_ignore_ascii_case("none") => None,
+            Some(s) => Some(tpm::parse_pcr_list(s).context("parsing --seal-tpm-pcrs")?),
+        };
+        return pairing::run_reseal_policy(new_pcrs.as_deref());
+    }
 
     let storage_path = args
         .storage
@@ -162,9 +171,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Load host-side key (if paired). TPM-aware: if KEY_TPM_PATH exists, we
-    // MUST unseal it — falling back to plaintext would defeat the seal. On
-    // unseal failure (PCR7 mismatch) the daemon refuses to start; the journal
-    // message tells the operator to run the reseal ceremony.
+    // MUST unseal it — falling back to plaintext would defeat the seal.
     let auth_key = match keystore::load_key_with_source() {
         Ok(Some((k, src))) => {
             tracing::info!(
@@ -181,12 +188,15 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(
                 error = ?e,
                 "FATAL: TPM-sealed key present but could not be unsealed. \
-                 Boot state (PCR7) changed since pairing. \
-                 Recovery: stop r503d, then run `sudo dist/reseal-tpm.sh`. \
+                 Most likely cause: a Secure Boot database update (fwupd \
+                 dbx/db/KEK) moved PCR7 — check `fwupdmgr get-history`. \
+                 Recovery: stop r503d, then run `sudo bash pcside/daemon/dist/reseal-tpm.sh`. \
                  Until then, fingerprint login is disabled; PAM will fall \
                  back to password (SPEC §13.12)."
             );
-            return Err(e.context("loading host key"));
+            // Exit code 78 so systemd's RestartPreventExitStatus can stop an
+            // unbounded crash loop instead of retrying against the same seal.
+            std::process::exit(78);
         }
     };
 

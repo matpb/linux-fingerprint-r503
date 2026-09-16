@@ -144,8 +144,9 @@ pub fn load_key_with_source() -> Result<Option<(Zeroizing<[u8; 16]>, KeySource)>
             .with_context(|| format!("reading sealed key blob at {}", KEY_TPM_PATH))?;
         let key = crate::tpm::unseal_key(&blob).context(
             "unsealing TPM-protected host key. \
-                 The Secure Boot policy (PCR7) changed since this key was sealed. \
-                 Recovery: `sudo dist/reseal-tpm.sh` (SPEC §13.12).",
+                 Most likely a Secure Boot database update (fwupd dbx/db/KEK) — \
+                 check `fwupdmgr get-history`. \
+                 Recovery: `sudo bash pcside/daemon/dist/reseal-tpm.sh` (SPEC §13.12).",
         )?;
         return Ok(Some((key, KeySource::Tpm)));
     }
@@ -244,7 +245,16 @@ pub fn save_key_sealed(key: &[u8; 16]) -> Result<()> {
 pub fn save_key_sealed_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<()> {
     let blob = crate::tpm::seal_key_with_pcrs(key, pcrs)
         .with_context(|| format!("sealing key to TPM (PCRs {:?})", pcrs))?;
+    persist_sealed_blob(&blob)?;
 
+    // Wipe plaintext copies. The whole point of sealing is that the key isn't
+    // sitting in plaintext on disk anymore.
+    delete_key().ok();
+    Ok(())
+}
+
+/// Atomic dir+tmp+rename write to `KEY_TPM_PATH`. Shared with `--reseal-policy`.
+pub fn persist_sealed_blob(blob: &[u8]) -> Result<()> {
     fs::create_dir_all(KEY_DIR).with_context(|| format!("creating {}", KEY_DIR))?;
     fs::set_permissions(KEY_DIR, fs::Permissions::from_mode(0o700)).ok();
 
@@ -257,14 +267,18 @@ pub fn save_key_sealed_with_pcrs(key: &[u8; 16], pcrs: &[u8]) -> Result<()> {
             .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp))?;
-        f.write_all(&blob)?;
+        f.write_all(blob)?;
         f.sync_all()?;
     }
     fs::rename(&tmp, KEY_TPM_PATH)
         .with_context(|| format!("renaming {} → {}", tmp, KEY_TPM_PATH))?;
+    Ok(())
+}
 
-    // Wipe plaintext copies. The whole point of sealing is that the key isn't
-    // sitting in plaintext on disk anymore.
+/// Seal to the TPM with no PCR policy; mirrors `save_key_sealed_with_pcrs`.
+pub fn save_key_sealed_no_policy(key: &[u8; 16]) -> Result<()> {
+    let blob = crate::tpm::seal_key_no_policy(key).context("sealing key to TPM (no policy)")?;
+    persist_sealed_blob(&blob)?;
     delete_key().ok();
     Ok(())
 }

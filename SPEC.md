@@ -630,7 +630,7 @@ The counter-ceiling hardening (§13.4, 2026-05-28 audit / DoS-2) bumped both to 
 
 ### 13.12 Host key sealing to TPM2 (opt-in)
 
-**Status: implemented behind `r503d --pair --seal-tpm`.** Adds a TPM2-sealed copy of the SipHash key at `/var/lib/r503d/key.tpm`, replacing the plaintext `key` / `key.bak` files. The seal binds the key to **PCR7** (Secure Boot policy and keys), so the key only unwraps on the same physical machine running with the same Secure Boot configuration.
+**Status: implemented behind `r503d --pair --seal-tpm`.** Adds a TPM2-sealed copy of the SipHash key at `/var/lib/r503d/key.tpm`, replacing the plaintext `key` / `key.bak` files. `--pair --seal-tpm` still binds to **PCR7** by default (Secure Boot policy and keys), so the key only unwraps on the same physical machine running with the same Secure Boot configuration. A separate one-shot, `--reseal-policy`, defaults the other way — no PCR policy at all — to re-seal an *existing* key without re-pairing; see **"`--reseal-policy`: changing an existing seal's policy in place"** below and the Secure-Boot-disabled caveat under "PCR choice".
 
 **Threat closed.** §13.1 explicitly carves out "host root compromise" as out-of-scope (root can always read `/var/lib/r503d/key`), but the plaintext file is also readable in scenarios that *don't* require booting the OS:
 
@@ -640,26 +640,27 @@ The counter-ceiling hardening (§13.4, 2026-05-28 audit / DoS-2) bumped both to 
 
 With the key sealed, those scenarios get ciphertext. The unwrap key never leaves the TPM, and the TPM only releases it when current PCR values match the policy baked into the sealed object at pairing time.
 
-**PCR choice: PCR7 by default; `--seal-tpm-pcrs=<list>` opts into additional PCRs.** PCR7 measures Secure Boot policy and the keys that signed the booted EFI binaries. It survives kernel and initrd updates (those don't change SB policy), survives `fwupd` UEFI firmware updates (those measure into PCR0, not PCR7), and survives `dnf upgrade` of grub2/shim. It only changes when:
+**PCR choice: PCR7 by default on `--pair --seal-tpm`; `--seal-tpm-pcrs=<list>` opts into additional PCRs; `--reseal-policy` (below) can also drop PCR binding entirely.** PCR7 measures Secure Boot policy and the keys that signed the booted EFI binaries: it is extended by five `EV_EFI_VARIABLE_DRIVER_CONFIG` events (`SecureBoot`, `PK`, `KEK`, `db`, `dbx`), one `EV_EFI_VARIABLE_AUTHORITY` event (`SbatLevel`), and one `EV_SEPARATOR`. Plain kernel and initrd updates, and `dnf upgrade` of grub2/shim, are safe — none of them touch any of those variables. `fwupd` **system firmware** updates measure into PCR0, not PCR7, and are likewise safe.
 
-- Secure Boot is turned off or back on.
-- A new MOK key is enrolled.
-- The SB key database is edited from the UEFI firmware UI.
-- The disk (or SSD) is moved to a different machine with a different SB configuration.
+**But `fwupd` Secure Boot database updates — dbx, db, KEK — DO change PCR7, and pulled from LVFS through routine, unattended desktop updates (e.g. KDE Discover bundling `dnf` and `fwupd` together) they are the dominant real-world cause of seal breakage**, not a deliberate operator action. A `db` or `dbx` bump (for example KEK CA 2011→2023, or a dbx revision-list refresh) invalidates the seal on the next boot. Because these arrive in the same batch as ordinary package updates, the resulting breakage is easy to misattribute to whichever kernel shipped alongside it, which sends the investigation at the wrong package every time. **`fwupdmgr get-history` is the diagnostic**: check it before assuming a kernel bump broke the seal.
 
-Each of those is something the operator deliberately did or had done to them — exactly the events we want to invalidate the seal for. PCR0 / PCR4 / PCR8 are intentionally not bound by default, on the principle that operational pain that doesn't buy security is just pain.
+PCR7 also still changes when Secure Boot is turned off or back on, a new MOK key is enrolled, the SB key database is edited from the UEFI firmware UI, or the disk is moved to a different machine. PCR0 / PCR4 / PCR8 are intentionally not bound by default, on the principle that operational pain that doesn't buy security is just pain.
 
-**Binding additional PCRs (advanced).** `r503d --pair --seal-tpm --seal-tpm-pcrs=<list>` and the matching `dist/reseal-tpm.sh --pcrs <list>` accept a comma-separated list of PCR indices in the SHA256 bank:
+**The Secure-Boot-disabled caveat.** On a host with Secure Boot **disabled**, PCR7 binding buys less than it looks like. `SbatLevel` is not a churn source in that state — shim resets it to `SBAT_VAR_ORIGINAL` every boot, so `SbatLevelRT` reads the same value on every boot — but it also means the firmware measures the same five variables, and any shim ≥ 15.7 measures the same original `SbatLevel`, that a same-distro Live USB would measure. A Fedora Live USB on that hardware reproduces the identical PCR7 value and unseals the key just as the real boot does. What PCR7-or-not sealing genuinely buys on such a host is that the key is bound to *this physical TPM* — ciphertext to an offline-disk attacker — not that it distinguishes this machine's normal boot from a same-distro Live USB. That is the rationale for `--reseal-policy`'s no-policy default: on an SB-disabled host, dropping the PCR policy trades away fragility (silent breakage on every `db`/`dbx` update) for a security property PCR7 wasn't actually providing. Enabling Secure Boot changes this calculus — `SbatLevel` becomes a genuine churn source and PCR7 starts discriminating real boots from generic Live media.
+
+**Binding additional PCRs (advanced).** `r503d --pair --seal-tpm --seal-tpm-pcrs=<list>` and the matching `pcside/daemon/dist/reseal-tpm.sh --pcrs <list>` accept a comma-separated list of PCR indices in the SHA256 bank:
 
 - `7,11` — PCR7 + PCR11 (systemd-stub UKI measurement, binds kernel+initrd hash). Any kernel update requires re-running `reseal-tpm.sh` to re-seal against the new measurement.
 - `0,4,7` — Adds PCR0 (UEFI firmware / CRTM) and PCR4 (bootloader / shim). Useful on machines where firmware updates should also invalidate the seal.
 - `7` — the default; equivalent to omitting the flag.
 
-The PCR list is encoded into the sealed blob (on-disk format bumps from `R503TPM\x01` to `R503TPM\x02` when used; existing `\x01` blobs continue to load as PCR7-only) so `unseal_key` reconstructs the same policy automatically — no operator state needs to be remembered separately.
+The PCR list is encoded into the sealed blob (on-disk format bumps from `R503TPM\x01` to `R503TPM\x02` when used; existing `\x01` blobs continue to load as PCR7-only) so `unseal_key` reconstructs the same policy automatically — no operator state needs to be remembered separately. Dropping the PCR policy entirely (the `--reseal-policy` default, or `--reseal-policy --seal-tpm-pcrs=none`) uses a third on-disk format, `R503TPM\x03` — see **"On-disk sealed-blob format (v1 / v2 / v3)"** below.
 
-**Failure mode.** When PCR7 changes between pair time and boot time, `TPM2_Unseal` returns `TPM_RC_POLICY_FAIL`. The daemon refuses to start with a journal message pointing at the recovery ceremony. PAM falls back to the next configured auth method (typically password). There is **no plaintext fallback**: keeping a plaintext copy alongside the sealed blob would defeat the seal.
+**Failure mode.** When PCR7 changes between pair time and boot time (or the TPM otherwise refuses to unseal), `TPM2_Unseal` returns `TPM_RC_POLICY_FAIL`. `main.rs`'s startup key load treats this as fatal: it logs at `tracing::error!` pointing at `fwupdmgr get-history` and the recovery ceremony, then calls `std::process::exit(78)`. There is **no plaintext fallback** — keeping a plaintext copy alongside the sealed blob would defeat the seal — so PAM falls back to the next configured auth method (typically password) for that login, but the daemon itself does not quietly limp along: it dies.
 
-**Recovery (the reseal ceremony).** Run `sudo bash dist/reseal-tpm.sh`. The script:
+Exit 78 is deliberate, not incidental: `r503d.service` sets `RestartPreventExitStatus=78` so systemd does **not** restart the unit on this exit code (an unbounded restart loop against a seal that will never re-satisfy itself is pure noise), alongside `StartLimitIntervalSec=60` / `StartLimitBurst=3` for any other failure mode, and `OnFailure=r503d-alert.service`. The alert unit runs `/usr/local/bin/r503d-alert.sh` as root, which logs at `syslog` priority `alert` (falling back to `logger -p auth.alert` if `systemd-cat` is unavailable) and pushes a critical `notify-send` desktop notification into every active `wayland`/`x11` graphical session it finds via `loginctl list-sessions`. Before this was added, a failed unseal crash-looped `r503d` undetected for two days on the author's own machine — it read as a quiet, silent fallback to password auth rather than the daemon actually being down.
+
+**Recovery (the reseal ceremony).** Run `sudo bash pcside/daemon/dist/reseal-tpm.sh`. The script:
 
 1. Stops `r503d.service`.
 2. Reflashes the Nano with `firmware/r503fp_wipe/` to clear the EEPROM (the old SipHash key on the Nano is paired to the lost host key — both sides have to forget together).
@@ -672,23 +673,37 @@ Wall-clock: ~90 seconds. Enrolled fingers are preserved — templates live in th
 
 **No new firmware command.** The reseal flow uses the existing reflash-to-wipe path (`firmware/r503fp_wipe/`, §13.5). The running firmware's command surface is unchanged from `fw=1.0`. The capability the wrapper script depends on — "anyone with physical USB access can reflash the Nano" — was already documented in §13.1 bullet 4 as out-of-scope. We're just using it as a deliberate recovery tool.
 
+**`--reseal-policy`: changing an existing seal's policy in place.** `r503d --reseal-policy [--seal-tpm-pcrs <list|none>]` is a one-shot CLI (`pairing::run_reseal_policy`) that re-seals the *existing* host key under a new policy without touching the Nano at all: it never opens the serial port, never touches the R503/Nano, never creates `/etc/r503d/allow-pair`, and never invokes `arduino-cli`. Default (and the literal `none`) means no PCR policy — that produces a v3 blob (below); a PCR list produces a v1/v2 blob exactly as `--pair --seal-tpm-pcrs=<list>` would.
+
+It works by loading the current key via the normal TPM-aware path (`keystore::load_key_with_source`), which also means it transparently migrates a plaintext-key install to sealed without re-pairing — no distinct "seal an existing plaintext key" flag is needed. It then builds the new blob, **unseals that new blob and constant-time-compares (`subtle::ConstantTimeEq`) it against the already-loaded key BEFORE writing anything**, and only then persists atomically (`keystore::persist_sealed_blob`). If that verification fails, it refuses to write and the existing `key.tpm` is left untouched.
+
+It also **refuses to run when the existing blob cannot be unsealed at all** — that's a TPM_RC_POLICY_FAIL-class failure, and `--reseal-policy` cannot recover a key it can't read. In that case the error points the operator at `sudo bash pcside/daemon/dist/reseal-tpm.sh`, which remains the **only** recovery once the key is already unrecoverable: the firmware won't re-pair while it thinks it's already paired, and `--unpair` needs a valid MAC over the current counter to authorize itself, which requires the very key that's now unreadable. `--reseal-policy` is the fast, non-destructive path when the key is still readable (e.g. reacting to a `db`/`dbx` update *before* it breaks the seal, or deliberately dropping PCR binding on an SB-disabled host); `reseal-tpm.sh` is the wipe-and-re-pair ceremony for when it's too late for that.
+
 **Crypto details.**
 
 - **Library:** Rust `tss-esapi` 7.x, linking against system `tpm2-tss` (`/dev/tpmrm0`, the resource-managed TPM device).
 - **Primary key:** Restricted-decryption RSA-2048 on the Owner hierarchy. The Owner Primary Seed is persistent and deterministic across reboots, so the daemon recreates the same primary on each unseal — no need to persist a primary handle.
-- **Sealed object:** `TPM_ALG_KEYEDHASH` with `userWithAuth = false`, `adminWithPolicy = true`. The only path to authorize the unseal is to satisfy the PCR policy.
-- **Policy:** `TPM2_PolicyPCR` over `sha256:7`. Trial session at seal time computes the policy digest, real session at unseal time satisfies it against current PCR7.
-- **On-disk format:** magic `R503TPM\x01` + length-prefixed `Public` (TPM2-marshalled) + length-prefixed `Private` (raw TPM2B buffer). Written atomically (`tmp → fsync → rename`) at mode `0600 root:root`.
+- **Sealed object (v1/v2, PCR-bound):** `TPM_ALG_KEYEDHASH` with `userWithAuth = false`, `adminWithPolicy = true`. The only path to authorize the unseal is to satisfy the PCR policy.
+- **Sealed object (v3, no-policy):** `TPM_ALG_KEYEDHASH` with no `auth_policy` at all, `admin_with_policy(false)`, `user_with_auth(true)`. An empty-password USER session authorizes the unseal — no policy session is started. `no_da(true)` is retained in both cases (`sealed_object_template` / `sealed_object_template_no_policy`, `pcside/daemon/src/tpm.rs`).
+- **Policy (v1/v2 only):** `TPM2_PolicyPCR` over `sha256:<bound PCRs>` (`sha256:7` by default). Trial session at seal time computes the policy digest, real session at unseal time satisfies it against current PCR values.
 
-**Implementation footprint:**
+**On-disk sealed-blob format (v1 / v2 / v3).** All three share the same core layout: 8-byte magic + `pub_len` (`u32` LE) + `pub_bytes` (TPM2-marshalled `Public`) + `priv_len` (`u32` LE) + `priv_bytes` (raw `Private` TPM2B buffer), written atomically (`tmp → fsync → rename`) at mode `0600 root:root`.
+
+- `R503TPM\x01` (v1) — no PCR list in the blob; implicit PCR7. Still deserializes and unseals exactly as before.
+- `R503TPM\x02` (v2) — inserts `[pcr_count: u8, pcr_list: u8 × N]` between the magic and `pub_len`; explicit PCR set, any combination. Still deserializes and unseals exactly as before.
+- `R503TPM\x03` (v3, new) — identical byte layout to v1 (no PCR bytes at all), but means "TPM-bound, no PCR policy" rather than "implicit PCR7". Produced by `seal_key_no_policy` / read by `unseal_with_no_policy`. This is what `--reseal-policy` (default, or explicit `none`) writes.
+
+**Implementation footprint** (`wc -l`, 2026-09-16):
 
 | Component | Lines |
 |---|---:|
-| `pcside/daemon/src/tpm.rs` | ~310 incl. tests |
-| `pcside/daemon/src/keystore.rs` additions (`load_key_with_source`, `save_key_sealed`, `delete_sealed_key`, `delete_all_keys`) | ~70 |
-| `pcside/daemon/src/pairing.rs` additions (`--seal-tpm` flag wiring, `run_reseal_tpm`) | ~65 |
-| `pcside/daemon/src/main.rs` deltas (CLI flags + boot-time refuse-on-unseal-fail) | ~25 |
-| `pcside/daemon/dist/reseal-tpm.sh` | ~110 |
+| `pcside/daemon/src/tpm.rs` | 824 incl. tests |
+| `pcside/daemon/src/keystore.rs` | 378 |
+| `pcside/daemon/src/pairing.rs` | 768 |
+| `pcside/daemon/src/main.rs` | 316 |
+| `pcside/daemon/dist/reseal-tpm.sh` | 180 |
+| `pcside/daemon/dist/r503d-alert.sh` | 41 |
+| `pcside/daemon/dist/r503d-alert.service` | 8 |
 
 **What's still out of scope.**
 

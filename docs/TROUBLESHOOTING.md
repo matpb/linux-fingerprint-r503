@@ -43,3 +43,58 @@ To test the Uno's SoftSerial independently, measure TX voltage during continuous
 ## "Wiring works but sensor seems dead"
 
 Before anything else, **verify sensor GND with a multimeter** end-to-end. "I plugged it in" is not proof. On 2026-05-23 we wasted ~90 minutes debugging sensor symptoms because the sensor's black wire was floating (not in the breadboard's GND rail). Touch detection, UART, and LED control all behave erratically without proper GND.
+
+## "Fingerprint login stopped working after a routine system update"
+
+**Root cause:** the TPM-sealed host key is bound to a PCR policy (PCR7 by default, SPEC §13.12) and the boot state no longer matches. `TPM2_Unseal` returns `TPM_RC_POLICY_FAIL` (`0x99d`), `r503d` refuses to start, and PAM falls back to password — quietly, unless the alerting below is installed.
+
+**Symptom set:**
+- `systemctl status r503d` shows the unit failed or restarting
+- `journalctl -u r503d` contains `Esys_Unseal() ... ErrorCode (0x0000099d)` and `FATAL: TPM-sealed key present but could not be unsealed`
+- The sensor's LED never lights at the login or lock screen
+- `sudo` and unlock still work, by password
+
+**The suspect is almost never the kernel.** PCR7 is not extended by kernel or initrd updates. It *is* extended by the Secure Boot variables (`SecureBoot`, `PK`, `KEK`, `db`, `dbx`), and `fwupd` ships `db`/`dbx`/`KEK` updates from LVFS through ordinary unattended desktop updates — usually in the same batch as a kernel, which is what makes the kernel look guilty.
+
+**Diagnose:**
+
+```bash
+fwupdmgr get-history          # look for UEFI dbx / UEFI CA / KEK CA entries near the failure date
+mokutil --sb-state            # Secure Boot on or off changes what PCR7 is worth
+sudo tpm2_eventlog /sys/kernel/security/tpm0/binary_bios_measurements | grep -A2 'PCRIndex: 7'
+```
+
+**Fix, in order of preference:**
+
+1. If the key is still readable (the daemon was running before you stopped it), re-seal it in place — seconds, and the Nano is never touched:
+
+   ```bash
+   sudo systemctl stop r503d
+   sudo r503d --reseal-policy            # drops PCR binding; --seal-tpm-pcrs 7 keeps it
+   sudo systemctl start r503d
+   ```
+
+2. If the key is already unrecoverable, only the full ceremony works, because the firmware will not re-pair while paired and `unpair` needs a valid MAC:
+
+   ```bash
+   sudo bash pcside/daemon/dist/reseal-tpm.sh
+   ```
+
+   Enrolled fingers survive either path — templates live on the R503's own flash.
+
+**Stop it happening silently.** The daemon exits `78` on an unrecoverable unseal; `r503d.service` sets `RestartPreventExitStatus=78` so it fails fast instead of crash-looping, and `OnFailure=r503d-alert.service` pushes a desktop notification. Without those, a broken seal can sit unnoticed for days.
+
+## "`fprintd-verify` says verify-no-match but the journal shows a confident match"
+
+`fprintd-verify` with no `-f` picks one specific finger. If you present a different one, `r503d` logs a genuine match and then rejects it for being the wrong slot:
+
+```
+VerifyStart user=... selected=left-index-finger expected={3}
+verify done slot=5 confidence=183 accepted=false
+```
+
+That output is good news: a `slot=N confidence=NNN` line proves the authenticated v2 channel is healthy, since a bad or unsealable key fails at the MAC long before any matching happens. Check the name→slot map in `/var/lib/r503d/users.json` — the order `fprintd-verify` prints when listing enrolled fingers is **not** slot order — then re-run with the right finger:
+
+```bash
+fprintd-verify -f right-index-finger "$USER"
+```

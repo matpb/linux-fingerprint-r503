@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # reseal-tpm.sh — recovery ceremony for SPEC §13.12 TPM seal failures.
 #
-# Run with: sudo bash dist/reseal-tpm.sh
+# Run with: sudo bash pcside/daemon/dist/reseal-tpm.sh
 #
 # When the daemon refuses to start with "TPM-sealed key present but could
 # not be unsealed", the Secure Boot policy (PCR7) baked into the seal at

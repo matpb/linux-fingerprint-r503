@@ -220,6 +220,13 @@ Same flow, plus `--seal-tpm`. The generated key is sealed to **PCR7**
 instead of the plaintext `key` file. Offline-disk attackers (`dd` of an
 unmounted partition, SSD swap into a hostile host) get ciphertext only.
 
+If Secure Boot is **disabled** on this host, PCR7 binding doesn't
+distinguish a normal boot from a same-distro Live USB (both measure the
+same PCR7), so it adds reseal fragility without a matching security gain.
+`--pair --seal-tpm` still binds PCR7 by default; drop that binding
+afterwards with `sudo r503d --reseal-policy` (no re-pairing, no Nano
+involved — see below). See `SPEC.md` §13.12.
+
 ```bash
 sudo systemctl stop r503d
 sudo mkdir -p /etc/r503d
@@ -241,12 +248,18 @@ sudo r503d --status
 # allow-pair:       (absent)
 ```
 
-Kernel updates, initrd updates, `fwupd` UEFI firmware updates, and grub2
-updates do **not** change PCR7 and do not require a reseal. PCR7 only
-changes on Secure Boot policy edits, MOK enrollments, or moving the disk
-to a different host — at which point the daemon refuses to start with
-`TPM_RC_POLICY_FAIL` and `dist/reseal-tpm.sh` recovers in ~90 seconds.
-See [Recovery: PCR7 changed](#recovery-pcr7-changed-need-to-reseal).
+Kernel updates, initrd updates, `fwupd` **system firmware** updates, and
+grub2 updates do **not** change PCR7 and do not require a reseal. But
+`fwupd` **Secure Boot database** updates (dbx/db/KEK, delivered from LVFS
+through routine desktop updates) DO change PCR7 and are the most common
+real-world cause of a broken seal — check `fwupdmgr get-history` before
+assuming a kernel bump did it. When the daemon can no longer unseal the
+key it exits (status 78) with a journal message pointing here; if
+`key.tpm` is still readable, `sudo r503d --reseal-policy` re-seals it in
+place in seconds without touching the Nano. If it's already unreadable,
+`pcside/daemon/dist/reseal-tpm.sh` is the fallback — it wipes and
+re-pairs the Nano and takes ~90 seconds. See
+[Recovery: PCR7 changed](#recovery-pcr7-changed-need-to-reseal).
 
 ### 5. Enroll & verify
 
@@ -285,9 +298,28 @@ to a plaintext key on disk.
 ### Recovery: PCR7 changed, need to reseal
 
 If you used `--pair --seal-tpm` and later changed something that PCR7
-measures (Secure Boot turned off/on, new MOK enrolled, disk moved to
-another box), the daemon will refuse to start with a journal message
-about `TPM_RC_POLICY_FAIL`. Recovery is one command:
+measures — most often a `fwupd` Secure Boot database update (dbx/db/KEK;
+check `fwupdmgr get-history`), also Secure Boot turned off/on, a new MOK
+enrolled, or the disk moved to another box — the daemon exits (status 78)
+with a journal message about `TPM_RC_POLICY_FAIL`.
+
+**Fast path — key still readable:** re-seal in place, no Nano involved:
+
+```bash
+sudo systemctl stop r503d
+sudo r503d --reseal-policy                 # drops PCR policy (the new default)
+# - or -
+sudo r503d --reseal-policy --seal-tpm-pcrs 7   # re-seals to current PCR7
+sudo systemctl start r503d
+```
+
+It loads the existing key, builds the new blob, unseals and
+constant-time-compares it against the loaded key *before* writing
+anything, and refuses to touch `key.tpm` on any mismatch.
+
+**Ceremony — key unrecoverable:** if the blob itself can no longer be
+unsealed, `--reseal-policy` can't help (it has nothing to compare
+against). That's the one case the wipe-and-re-pair ceremony is still for:
 
 ```bash
 sudo bash pcside/daemon/dist/reseal-tpm.sh
@@ -328,7 +360,7 @@ could already do by garbling frames). See [`SPEC.md` §13.11](SPEC.md).
 The authenticated `--unpair` needs the key to authorize. If all the
 on-disk copies are gone (disk crash, accidental rm, both `key` + `key.bak`
 deleted, or `key.tpm` blob lost), you need the **reflash-to-wipe** escape
-hatch — same procedure that `dist/reseal-tpm.sh` automates for the
+hatch — same procedure that `pcside/daemon/dist/reseal-tpm.sh` automates for the
 PCR7-changed case above:
 
 ```bash

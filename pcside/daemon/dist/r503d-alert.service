@@ -1,0 +1,8 @@
+[Unit]
+Description=r503d fingerprint daemon failure alert
+Documentation=https://github.com/matpb/linux-fingerprint-r503
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/r503d-alert.sh "r503d fingerprint daemon has failed — auth has fallen back to password"

@@ -5,6 +5,9 @@ After=dbus.service systemd-udevd.service
 Wants=dbus.service
 # Conflicts with upstream fprintd — only one can own net.reactivated.Fprint.
 Conflicts=fprintd.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+OnFailure=r503d-alert.service
 
 [Service]
 Type=dbus
@@ -12,6 +15,7 @@ BusName=net.reactivated.Fprint
 ExecStart=/usr/local/bin/r503d
 Restart=on-failure
 RestartSec=2s
+RestartPreventExitStatus=78
 User=root
 Environment=RUST_LOG=info,r503d=info
 

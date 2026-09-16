@@ -22,10 +22,10 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-echo ">>> [1/9] installing r503d binary -> /usr/local/bin/r503d"
+echo ">>> [1/12] installing r503d binary -> /usr/local/bin/r503d"
 install -m 0755 -o root -g root "$BINARY" /usr/local/bin/r503d
 
-echo ">>> [2/9] creating /var/lib/r503d state dir"
+echo ">>> [2/12] creating /var/lib/r503d state dir"
 install -d -m 0700 -o root -g root /var/lib/r503d
 
 # Note: this installer does NOT seed /var/lib/r503d/users.json from any
@@ -36,7 +36,7 @@ install -d -m 0700 -o root -g root /var/lib/r503d
 # `cp` the file explicitly and double-check the usernames against
 # `getpwnam` before re-pairing.
 
-echo ">>> [3/9] installing udev rule -> /etc/udev/rules.d/70-r503.rules"
+echo ">>> [3/12] installing udev rule -> /etc/udev/rules.d/70-r503.rules"
 install -m 0644 -o root -g root "$DIST_DIR/70-r503.rules" /etc/udev/rules.d/70-r503.rules
 udevadm control --reload
 udevadm trigger --subsystem-match=tty
@@ -48,20 +48,20 @@ else
     echo "     daemon will fall back to scanning /dev/ttyACM* and /dev/ttyUSB*)"
 fi
 
-echo ">>> [4/9] installing systemd unit -> /etc/systemd/system/r503d.service"
+echo ">>> [4/12] installing systemd unit -> /etc/systemd/system/r503d.service"
 install -m 0644 -o root -g root "$DIST_DIR/r503d.service" /etc/systemd/system/r503d.service
 
-echo ">>> [5/9] overriding D-Bus autolaunch -> /usr/local/share/dbus-1/system-services/"
+echo ">>> [5/12] overriding D-Bus autolaunch -> /usr/local/share/dbus-1/system-services/"
 install -d -m 0755 /usr/local/share/dbus-1/system-services
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.Fprint.service" \
     /usr/local/share/dbus-1/system-services/net.reactivated.Fprint.service
 
-echo ">>> [6/10] installing polkit policy -> /usr/share/polkit-1/actions/"
+echo ">>> [6/12] installing polkit policy -> /usr/share/polkit-1/actions/"
 install -d -m 0755 /usr/share/polkit-1/actions
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.fprint.device.r503d.policy" \
     /usr/share/polkit-1/actions/net.reactivated.fprint.device.r503d.policy
 
-echo ">>> [7/10] installing D-Bus system bus policy -> /etc/dbus-1/system.d/"
+echo ">>> [7/12] installing D-Bus system bus policy -> /etc/dbus-1/system.d/"
 install -m 0644 -o root -g root "$DIST_DIR/net.reactivated.Fprint.conf" \
     /etc/dbus-1/system.d/net.reactivated.Fprint.conf
 # Tell the bus to reread its system policies. dbus-broker supports reload;
@@ -72,14 +72,20 @@ systemctl reload dbus-broker.service 2>/dev/null \
     || systemctl restart dbus-broker.service 2>/dev/null \
     || systemctl restart dbus.service
 
-echo ">>> [8/10] systemctl daemon-reload"
+echo ">>> [8/12] installing alert script -> /usr/local/bin/r503d-alert.sh"
+install -m 0755 -o root -g root "$DIST_DIR/r503d-alert.sh" /usr/local/bin/r503d-alert.sh
+
+echo ">>> [9/12] installing alert unit -> /etc/systemd/system/r503d-alert.service"
+install -m 0644 -o root -g root "$DIST_DIR/r503d-alert.service" /etc/systemd/system/r503d-alert.service
+
+echo ">>> [10/12] systemctl daemon-reload"
 systemctl daemon-reload
 
-echo ">>> [9/10] stopping + masking fprintd.service"
+echo ">>> [11/12] stopping + masking fprintd.service"
 systemctl stop fprintd.service 2>/dev/null || true
 systemctl mask fprintd.service
 
-echo ">>> [10/10] enabling + starting r503d.service"
+echo ">>> [12/12] enabling + starting r503d.service"
 systemctl enable r503d.service
 systemctl restart r503d.service
 
